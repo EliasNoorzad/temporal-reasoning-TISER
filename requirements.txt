@@ -1,0 +1,8 @@
+datasets
+evaluate
+notebook
+numpy
+pandas
+peft
+torch
+transformers

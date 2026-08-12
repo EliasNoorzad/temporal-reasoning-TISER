@@ -48,35 +48,5 @@ def load_qwen_model(
     return QwenModelBundle(tokenizer=tokenizer, model=model)
 
 
-def generate_response(
-    prompt: str,
-    bundle: QwenModelBundle,
-    system_prompt: str = "You are a careful temporal reasoning assistant.",
-    max_new_tokens: int = 256,
-) -> str:
-    """Generate a response from Qwen2.5-3B-Instruct."""
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-    text = bundle.tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = bundle.tokenizer([text], return_tensors="pt").to(bundle.model.device)
-
-    with torch.no_grad():
-        generated_ids = bundle.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-        )
-
-    output_ids = generated_ids[0][inputs.input_ids.shape[-1] :]
-    return bundle.tokenizer.decode(output_ids, skip_special_tokens=True)
-
-
 if __name__ == "__main__":
-    qwen = load_qwen_model()
-    answer = generate_response("What is temporal reasoning?", qwen)
-    print(answer)
+    load_qwen_model()

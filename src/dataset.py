@@ -1,9 +1,71 @@
-"""Dataset loading utilities for temporal reasoning experiments."""
+"""Dataset loading utilities for the TISER dataset."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from typing import Any
+
+from datasets import DatasetDict, load_dataset
 
 
-def load_dataset(path: str):
-    """Load a dataset from disk.
+DATASET_NAME = "AmazonScience/TISER"
 
-    This is a placeholder for the project-specific dataset reader.
-    """
-    raise NotImplementedError("Dataset loading is not implemented yet.")
+
+def load_tiser_dataset() -> DatasetDict:
+    """Load the official TISER dataset from Hugging Face."""
+    dataset = load_dataset(DATASET_NAME)
+    if not isinstance(dataset, DatasetDict):
+        raise TypeError(f"Expected a DatasetDict, got {type(dataset).__name__}.")
+    return dataset
+
+
+def _json_default(value: Any) -> str:
+    """Make uncommon dataset values printable as JSON."""
+    return str(value)
+
+
+def print_dataset_summary(sample_rows: int = 3) -> None:
+    """Print splits, sizes, column names, and sample rows for TISER."""
+    dataset = load_tiser_dataset()
+
+    print(f"Dataset: {DATASET_NAME}")
+    print("\nAvailable splits:")
+    for split_name in dataset.keys():
+        print(f"- {split_name}")
+
+    print("\nNumber of examples in each split:")
+    for split_name, split_dataset in dataset.items():
+        print(f"- {split_name}: {len(split_dataset)}")
+
+    print("\nColumn names:")
+    for split_name, split_dataset in dataset.items():
+        columns = ", ".join(split_dataset.column_names)
+        print(f"- {split_name}: {columns}")
+
+    print(f"\nSample rows ({sample_rows} per split):")
+    for split_name, split_dataset in dataset.items():
+        count = min(sample_rows, len(split_dataset))
+        print(f"\n[{split_name}]")
+        for index in range(count):
+            row = split_dataset[index]
+            print(json.dumps(row, indent=2, ensure_ascii=False, default=_json_default))
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Inspect the AmazonScience/TISER dataset.")
+    parser.add_argument(
+        "--sample-rows",
+        type=int,
+        default=3,
+        choices=range(2, 4),
+        metavar="{2,3}",
+        help="Number of sample rows to print per split.",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    print_dataset_summary(sample_rows=args.sample_rows)

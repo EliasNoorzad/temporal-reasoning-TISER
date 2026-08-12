@@ -37,12 +37,11 @@ def load_qwen_model(
     download model files.
     """
     dtype = torch_dtype or get_default_dtype()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True,
+        device_map=device_map
     )
     model.eval()
     return QwenModelBundle(tokenizer=tokenizer, model=model)

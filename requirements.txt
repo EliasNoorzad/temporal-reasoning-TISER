@@ -1,5 +1,6 @@
 datasets
 evaluate
+accelerate
 notebook
 numpy
 pandas

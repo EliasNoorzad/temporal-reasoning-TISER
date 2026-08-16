@@ -155,8 +155,7 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         report_to=args.report_to,
         max_length=args.max_seq_length,
         packing=False,
-        completion_only_loss=True,
-        save_safetensors=True,
+        completion_only_loss=True
     )
 
 

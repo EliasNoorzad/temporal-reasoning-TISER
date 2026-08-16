@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optim", default="adamw_torch")
     parser.add_argument("--report-to", default="none")
     parser.add_argument("--verify-samples", type=int, default=3)
-    parser.add_argument("--generation-max-new-tokens", type=int, default=128)
+    parser.add_argument("--generation-max-new-tokens", type=int, default=1024)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -67,7 +67,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def prepare_tiser_train_subset(subset_size: int, seed: int, eos_token: str) -> Any:
+def prepare_tiser_train_subset(
+    subset_size: int,
+    seed: int,
+    tokenizer: Any,
+    max_seq_length: int,
+) -> Any:
     dataset = load_tiser_dataset()
     if "train" not in dataset:
         raise KeyError("AmazonScience/TISER does not contain a train split.")
@@ -85,17 +90,38 @@ def prepare_tiser_train_subset(subset_size: int, seed: int, eos_token: str) -> A
     subset_count = min(subset_size, len(train_dataset))
     train_dataset = train_dataset.shuffle(seed=seed).select(range(subset_count))
 
-    def to_prompt_completion(example: dict[str, Any]) -> dict[str, str]:
+    def tokenize_prompt_completion(example: dict[str, Any]) -> dict[str, list[int]]:
         prompt = str(example["prompt"])
         completion = str(example["output"])
+        eos_token = tokenizer.eos_token or ""
         if eos_token and not completion.endswith(eos_token):
             completion = f"{completion}{eos_token}"
-        return {"prompt": prompt, "completion": completion}
+
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        completion_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
+
+        prompt_budget = max_seq_length - len(completion_ids)
+        if prompt_budget < 0:
+            prompt_ids = []
+            completion_ids = completion_ids[:max_seq_length]
+            if tokenizer.eos_token_id is not None and completion_ids:
+                completion_ids[-1] = tokenizer.eos_token_id
+        elif len(prompt_ids) > prompt_budget:
+            prompt_ids = prompt_ids[-prompt_budget:] if prompt_budget > 0 else []
+
+        input_ids = prompt_ids + completion_ids
+        labels = [-100] * len(prompt_ids) + completion_ids
+        attention_mask = [1] * len(input_ids)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
     return train_dataset.map(
-        to_prompt_completion,
+        tokenize_prompt_completion,
         remove_columns=train_dataset.column_names,
-        desc="Formatting TISER prompt/output pairs for SFT",
+        desc="Tokenizing TISER prompt/output pairs for SFT",
     )
 
 
@@ -155,7 +181,8 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         report_to=args.report_to,
         max_length=args.max_seq_length,
         packing=False,
-        completion_only_loss=True
+        dataset_kwargs={"skip_prepare_dataset": True},
+        save_safetensors=True,
     )
 
 
@@ -246,10 +273,19 @@ def main() -> None:
     train_dataset = prepare_tiser_train_subset(
         subset_size=args.subset_size,
         seed=args.seed,
-        eos_token=tokenizer.eos_token or "",
+        tokenizer=tokenizer,
+        max_seq_length=args.max_seq_length,
     )
     verification_prompts = [
-        str(example["prompt"]) for example in train_dataset.select(range(min(args.verify_samples, len(train_dataset))))
+        tokenizer.decode(
+            [
+                token_id
+                for token_id, label in zip(example["input_ids"], example["labels"])
+                if label == -100
+            ],
+            skip_special_tokens=True,
+        )
+        for example in train_dataset.select(range(min(args.verify_samples, len(train_dataset))))
     ]
 
     model = model_bundle.model

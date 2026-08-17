@@ -185,8 +185,7 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         packing=False,
         # The dataset is already tokenized and includes labels, so TRL should not
         # rebuild prompt/completion masks or alter the examples.
-        dataset_kwargs={"skip_prepare_dataset": True},
-        save_safetensors=True,
+        dataset_kwargs={"skip_prepare_dataset": True}
     )
 
 

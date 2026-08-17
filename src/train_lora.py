@@ -1,8 +1,4 @@
-"""Phase 4: tiny LoRA SFT run for TISER reproduction debugging.
-
-This script is intentionally configured for a cheap end-to-end smoke test, not
-the full TISER training experiment.
-"""
+"""LoRA supervised fine-tuning for TISER."""
 
 from __future__ import annotations
 
@@ -20,7 +16,7 @@ from src.dataset import load_tiser_dataset
 from src.model import MODEL_NAME, load_qwen_model
 
 
-DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/TISER/checkpoints/phase4_lora/"
+DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/TISER/checkpoints/lora/"
 DEFAULT_LORA_TARGET_MODULES = (
     "q_proj",
     "k_proj",
@@ -31,25 +27,22 @@ DEFAULT_LORA_TARGET_MODULES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a tiny LoRA SFT smoke test on AmazonScience/TISER."
+        description="Run LoRA supervised fine-tuning on AmazonScience/TISER."
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--subset-size", type=int, default=100)
-    parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--num-train-epochs", type=float, default=1.0)
-    parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--num-train-epochs", type=float, default=3.0)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--save-steps", type=int, default=5)
     parser.add_argument("--save-total-limit", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--optim", default="adamw_torch")
     parser.add_argument("--report-to", default="none")
     parser.add_argument("--verify-samples", type=int, default=3)
-    parser.add_argument("--generation-max-new-tokens", type=int, default=1024)
+    parser.add_argument("--generation-max-new-tokens", type=int, default=2048)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -67,9 +60,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def prepare_tiser_train_subset(
-    subset_size: int,
-    seed: int,
+def prepare_tiser_train_dataset(
     tokenizer: Any,
     max_seq_length: int,
 ) -> Any:
@@ -83,12 +74,6 @@ def prepare_tiser_train_subset(
     if missing_columns:
         missing = ", ".join(sorted(missing_columns))
         raise KeyError(f"TISER train split is missing required columns: {missing}")
-
-    if subset_size <= 0:
-        raise ValueError("--subset-size must be greater than 0 for this smoke test.")
-
-    subset_count = min(subset_size, len(train_dataset))
-    train_dataset = train_dataset.shuffle(seed=seed).select(range(subset_count))
 
     def tokenize_prompt_completion(example: dict[str, Any]) -> dict[str, list[int]]:
         prompt = str(example["prompt"])
@@ -163,7 +148,6 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
 
     return SFTConfig(
         output_dir=str(output_dir),
-        max_steps=args.max_steps,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -171,8 +155,7 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         logging_first_step=True,
-        save_strategy="steps",
-        save_steps=args.save_steps,
+        save_strategy="epoch",
         save_total_limit=args.save_total_limit,
         bf16=use_bf16,
         fp16=use_fp16,
@@ -181,7 +164,8 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         report_to=args.report_to,
         max_length=args.max_seq_length,
         packing=False,
-        dataset_kwargs={"skip_prepare_dataset": True}
+        dataset_kwargs={"skip_prepare_dataset": True},
+        save_safetensors=True,
     )
 
 
@@ -195,7 +179,7 @@ def build_trainer(
     lora_config = build_lora_config(args)
     sft_config = build_sft_config(args, output_dir)
 
-    # Prompt-completion format trains loss on TISER output tokens only.
+    # Explicit labels keep loss on output tokens only.
     return SFTTrainer(
         model=model,
         args=sft_config,
@@ -269,9 +253,7 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    train_dataset = prepare_tiser_train_subset(
-        subset_size=args.subset_size,
-        seed=args.seed,
+    train_dataset = prepare_tiser_train_dataset(
         tokenizer=tokenizer,
         max_seq_length=args.max_seq_length,
     )
@@ -295,7 +277,7 @@ def main() -> None:
     trainer = build_trainer(model, tokenizer, train_dataset, args, output_dir)
     print_parameter_summary(trainer.model)
 
-    print("Starting tiny Phase 4 LoRA SFT smoke test.")
+    print("Starting LoRA supervised fine-tuning.")
     trainer.train()
     final_adapter_dir = save_final_adapter(trainer, tokenizer, output_dir)
 

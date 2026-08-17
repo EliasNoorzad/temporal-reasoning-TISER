@@ -173,8 +173,7 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         max_length=args.max_seq_length,
         packing=False,
         # The dataset already contains input_ids, attention_mask, and labels.
-        dataset_kwargs={"skip_prepare_dataset": True},
-        save_safetensors=True,
+        dataset_kwargs={"skip_prepare_dataset": True}
     )
 
 

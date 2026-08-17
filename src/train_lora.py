@@ -18,6 +18,7 @@ from src.model import MODEL_NAME, load_qwen_model
 
 DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/TISER/checkpoints/lora/"
 DEFAULT_LORA_TARGET_MODULES = (
+    # Qwen attention projection layers used by the LoRA adapter.
     "q_proj",
     "k_proj",
     "v_proj",
@@ -69,6 +70,7 @@ def prepare_tiser_train_dataset(
         raise KeyError("AmazonScience/TISER does not contain a train split.")
 
     train_dataset = dataset["train"]
+    # TISER supervision is stored directly as prompt/output pairs.
     required_columns = {"prompt", "output"}
     missing_columns = required_columns.difference(train_dataset.column_names)
     if missing_columns:
@@ -82,9 +84,11 @@ def prepare_tiser_train_dataset(
         if eos_token and not completion.endswith(eos_token):
             completion = f"{completion}{eos_token}"
 
+        # Tokenize separately so the loss mask can ignore the prompt.
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         completion_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
 
+        # Keep the answer whenever truncation is needed, since it carries the loss.
         prompt_budget = max_seq_length - len(completion_ids)
         if prompt_budget < 0:
             prompt_ids = []
@@ -95,6 +99,7 @@ def prepare_tiser_train_dataset(
             prompt_ids = prompt_ids[-prompt_budget:] if prompt_budget > 0 else []
 
         input_ids = prompt_ids + completion_ids
+        # -100 tells PyTorch to ignore prompt tokens when computing loss.
         labels = [-100] * len(prompt_ids) + completion_ids
         attention_mask = [1] * len(input_ids)
         return {
@@ -111,6 +116,7 @@ def prepare_tiser_train_dataset(
 
 
 def build_lora_config(args: argparse.Namespace) -> LoraConfig:
+    # These settings are intentionally exposed as CLI arguments for tuning.
     return LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -122,6 +128,7 @@ def build_lora_config(args: argparse.Namespace) -> LoraConfig:
 
 
 def print_parameter_summary(model: torch.nn.Module) -> None:
+    # The trainable count is the simplest sanity check that LoRA is active.
     total_params = 0
     trainable_params = 0
     for parameter in model.parameters():
@@ -143,6 +150,7 @@ def print_parameter_summary(model: torch.nn.Module) -> None:
 
 
 def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
+    # Match the precision to the available Colab GPU.
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     use_fp16 = torch.cuda.is_available() and not use_bf16
 
@@ -164,7 +172,9 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         report_to=args.report_to,
         max_length=args.max_seq_length,
         packing=False,
-        dataset_kwargs={"skip_prepare_dataset": True}
+        # The dataset already contains input_ids, attention_mask, and labels.
+        dataset_kwargs={"skip_prepare_dataset": True},
+        save_safetensors=True,
     )
 
 
@@ -189,6 +199,7 @@ def build_trainer(
 
 
 def save_final_adapter(trainer: SFTTrainer, tokenizer: Any, output_dir: Path) -> Path:
+    # Save a stable adapter path in addition to epoch checkpoints.
     final_adapter_dir = output_dir / "final_adapter"
     final_adapter_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(final_adapter_dir))
@@ -203,6 +214,7 @@ def generate_from_reloaded_adapter(
     device_map: str,
     max_new_tokens: int,
 ) -> list[dict[str, str]]:
+    # Reload from disk to verify the saved adapter can be used later.
     base_bundle = load_qwen_model(MODEL_NAME, device_map=device_map)
     model = PeftModel.from_pretrained(base_bundle.model, str(adapter_dir))
     model.eval()
@@ -227,6 +239,7 @@ def write_reload_verification(
     generations: list[dict[str, str]],
     output_dir: Path,
 ) -> Path:
+    # Keep generated samples next to the adapter for quick inspection.
     output_path = output_dir / "reload_verification_generations.jsonl"
     with output_path.open("w", encoding="utf-8") as file:
         for generation in generations:
@@ -252,6 +265,7 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Tokenization happens before TRL so our label mask is explicit.
     train_dataset = prepare_tiser_train_dataset(
         tokenizer=tokenizer,
         max_seq_length=args.max_seq_length,

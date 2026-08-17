@@ -34,8 +34,8 @@ def parse_args() -> argparse.Namespace:
         description="Run a tiny LoRA SFT smoke test on AmazonScience/TISER."
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--subset-size", type=int, default=8)
-    parser.add_argument("--max-steps", type=int, default=5)
+    parser.add_argument("--subset-size", type=int, default=100)
+    parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--num-train-epochs", type=float, default=1.0)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)

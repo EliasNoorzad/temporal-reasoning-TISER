@@ -164,8 +164,7 @@ def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
         report_to=args.report_to,
         max_length=args.max_seq_length,
         packing=False,
-        dataset_kwargs={"skip_prepare_dataset": True},
-        save_safetensors=True,
+        dataset_kwargs={"skip_prepare_dataset": True}
     )
 
 

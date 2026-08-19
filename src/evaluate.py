@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-type", choices=("standard", "tiser"), required=True)
     parser.add_argument("--lora-adapter-path", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--device-map", default="auto")
     return parser.parse_args()
 
@@ -199,6 +199,32 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
+def to_percentage(score: float) -> float:
+    return score * 100
+
+
+def compute_macro_metrics(records: list[dict[str, Any]]) -> tuple[float, float]:
+    records_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        dataset_name = str(record["dataset_name"])
+        records_by_dataset.setdefault(dataset_name, []).append(record)
+
+    dataset_em_scores = []
+    dataset_f1_scores = []
+    for dataset_records in records_by_dataset.values():
+        dataset_total = len(dataset_records)
+        dataset_em_scores.append(
+            sum(record["exact_match"] for record in dataset_records) / dataset_total
+        )
+        dataset_f1_scores.append(
+            sum(record["token_f1"] for record in dataset_records) / dataset_total
+        )
+
+    macro_em = sum(dataset_em_scores) / len(dataset_em_scores)
+    macro_token_f1 = sum(dataset_f1_scores) / len(dataset_f1_scores)
+    return macro_em, macro_token_f1
+
+
 def write_summary(path: Path, records: list[dict[str, Any]]) -> dict[str, float | int]:
     total_examples = len(records)
     if total_examples == 0:
@@ -206,12 +232,19 @@ def write_summary(path: Path, records: list[dict[str, Any]]) -> dict[str, float 
             "total_examples": 0,
             "overall_em": 0.0,
             "overall_token_f1": 0.0,
+            "macro_em": 0.0,
+            "macro_token_f1": 0.0,
         }
     else:
+        overall_em = sum(record["exact_match"] for record in records) / total_examples
+        overall_token_f1 = sum(record["token_f1"] for record in records) / total_examples
+        macro_em, macro_token_f1 = compute_macro_metrics(records)
         summary = {
             "total_examples": total_examples,
-            "overall_em": sum(record["exact_match"] for record in records) / total_examples,
-            "overall_token_f1": sum(record["token_f1"] for record in records) / total_examples,
+            "overall_em": to_percentage(overall_em),
+            "overall_token_f1": to_percentage(overall_token_f1),
+            "macro_em": to_percentage(macro_em),
+            "macro_token_f1": to_percentage(macro_token_f1),
         }
 
     with path.open("w", encoding="utf-8") as file:
@@ -257,8 +290,10 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     print(f"Saved predictions to: {results_path}")
     print(f"Saved summary to: {summary_path}")
-    print(f"Overall EM: {summary['overall_em']:.4f}")
-    print(f"Overall token-level F1: {summary['overall_token_f1']:.4f}")
+    print(f"Overall EM: {summary['overall_em']:.2f}%")
+    print(f"Overall token-level F1: {summary['overall_token_f1']:.2f}%")
+    print(f"Macro EM: {summary['macro_em']:.2f}%")
+    print(f"Macro token-level F1: {summary['macro_token_f1']:.2f}%")
 
 
 if __name__ == "__main__":

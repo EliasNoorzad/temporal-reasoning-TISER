@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from peft import PeftModel
 from tqdm.auto import tqdm
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -23,6 +24,28 @@ from src.prompts import get_prompt_text
 
 
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+ANSWER_CLOSING_TAG = "</answer>"
+
+
+class AnswerClosingTagStoppingCriteria(StoppingCriteria):
+    """Stop TISER generation once the final answer tag is complete."""
+
+    def __init__(self, tokenizer: Any, prompt_length: int) -> None:
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+        **kwargs: Any,
+    ) -> bool:
+        continuation_ids = input_ids[0, self.prompt_length :]
+        continuation_text = self.tokenizer.decode(
+            continuation_ids,
+            skip_special_tokens=False,
+        )
+        return ANSWER_CLOSING_TAG in continuation_text
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +102,7 @@ def generate_response(
     model: torch.nn.Module,
     tokenizer: Any,
     prompt_text: str,
+    prompt_type: str,
     max_new_tokens: int,
 ) -> str:
     inputs = tokenizer(prompt_text, return_tensors="pt")
@@ -93,6 +117,10 @@ def generate_response(
     }
     if tokenizer.eos_token_id is not None:
         generation_args["pad_token_id"] = tokenizer.eos_token_id
+    if prompt_type == "tiser":
+        generation_args["stopping_criteria"] = StoppingCriteriaList(
+            [AnswerClosingTagStoppingCriteria(tokenizer, input_length)]
+        )
 
     with torch.inference_mode():
         generated_ids = model.generate(**generation_args)
@@ -263,6 +291,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt_text,
+            prompt_type=args.prompt_type,
             max_new_tokens=args.max_new_tokens,
         )
         records.append(

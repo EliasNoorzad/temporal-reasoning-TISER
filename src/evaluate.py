@@ -13,7 +13,7 @@ from typing import Any
 import torch
 from peft import PeftModel
 from tqdm.auto import tqdm
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import LogitsProcessor, LogitsProcessorList
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -27,25 +27,29 @@ ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE |
 ANSWER_CLOSING_TAG = "</answer>"
 
 
-class AnswerClosingTagStoppingCriteria(StoppingCriteria):
-    """Stop TISER generation once the final answer tag is complete."""
+class AnswerClosingTagLogitsProcessor(LogitsProcessor):
+    """Finish each TISER row after its generated answer tag is complete."""
 
-    def __init__(self, tokenizer: Any, prompt_length: int) -> None:
+    def __init__(self, tokenizer: Any, prompt_length: int, eos_token_id: int) -> None:
         self.tokenizer = tokenizer
         self.prompt_length = prompt_length
+        self.eos_token_id = eos_token_id
 
     def __call__(
         self,
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
-        **kwargs: Any,
-    ) -> bool:
-        continuation_ids = input_ids[0, self.prompt_length :]
-        continuation_text = self.tokenizer.decode(
-            continuation_ids,
-            skip_special_tokens=False,
-        )
-        return ANSWER_CLOSING_TAG in continuation_text
+    ) -> torch.FloatTensor:
+        for row_index in range(input_ids.shape[0]):
+            continuation_ids = input_ids[row_index, self.prompt_length :]
+            continuation_text = self.tokenizer.decode(
+                continuation_ids,
+                skip_special_tokens=False,
+            )
+            if ANSWER_CLOSING_TAG in continuation_text:
+                scores[row_index, :] = -float("inf")
+                scores[row_index, self.eos_token_id] = 0.0
+        return scores
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-adapter-path", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device-map", default="auto")
     return parser.parse_args()
 
@@ -98,14 +103,20 @@ def get_model_input_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
-def generate_response(
+def generate_responses(
     model: torch.nn.Module,
     tokenizer: Any,
-    prompt_text: str,
+    prompt_texts: list[str],
     prompt_type: str,
     max_new_tokens: int,
-) -> str:
-    inputs = tokenizer(prompt_text, return_tensors="pt")
+) -> list[str]:
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(prompt_texts, return_tensors="pt", padding=True)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
     input_length = inputs["input_ids"].shape[-1]
     input_device = get_model_input_device(model)
     inputs = {name: value.to(input_device) for name, value in inputs.items()}
@@ -117,17 +128,29 @@ def generate_response(
     }
     if tokenizer.eos_token_id is not None:
         generation_args["pad_token_id"] = tokenizer.eos_token_id
+        generation_args["eos_token_id"] = tokenizer.eos_token_id
     if prompt_type == "tiser":
-        generation_args["stopping_criteria"] = StoppingCriteriaList(
-            [AnswerClosingTagStoppingCriteria(tokenizer, input_length)]
+        if tokenizer.eos_token_id is None:
+            raise ValueError("TISER batched stopping requires an EOS token.")
+        generation_args["logits_processor"] = LogitsProcessorList(
+            [
+                AnswerClosingTagLogitsProcessor(
+                    tokenizer,
+                    input_length,
+                    tokenizer.eos_token_id,
+                )
+            ]
         )
 
     with torch.inference_mode():
         generated_ids = model.generate(**generation_args)
 
-    # The model output includes the prompt tokens first, so score only the continuation.
-    new_token_ids = generated_ids[0][input_length:]
-    return tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+    # With left padding, every row shares the same padded prompt length.
+    responses = []
+    for row_ids in generated_ids:
+        new_token_ids = row_ids[input_length:]
+        responses.append(tokenizer.decode(new_token_ids, skip_special_tokens=True).strip())
+    return responses
 
 
 def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
@@ -277,6 +300,9 @@ def write_summary(path: Path, records: list[dict[str, Any]]) -> dict[str, float 
 
 
 def run_evaluation(args: argparse.Namespace) -> None:
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,24 +310,34 @@ def run_evaluation(args: argparse.Namespace) -> None:
     test_dataset = load_test_split()
 
     records = []
-    # Generation is intentionally one example at a time to keep memory usage predictable.
-    for example in tqdm(test_dataset, desc="Generating", total=len(test_dataset)):
-        prompt_text = get_prompt_text(example, args.prompt_type)
-        raw_response = generate_response(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_text=prompt_text,
-            prompt_type=args.prompt_type,
-            max_new_tokens=args.max_new_tokens,
-        )
-        records.append(
-            make_result_record(
-                example=example,
+    with tqdm(total=len(test_dataset), desc="Generating") as progress_bar:
+        for batch_start in range(0, len(test_dataset), args.batch_size):
+            batch_end = min(batch_start + args.batch_size, len(test_dataset))
+            batch_examples = [
+                test_dataset[index]
+                for index in range(batch_start, batch_end)
+            ]
+            prompt_texts = [
+                get_prompt_text(example, args.prompt_type)
+                for example in batch_examples
+            ]
+            raw_responses = generate_responses(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_texts=prompt_texts,
                 prompt_type=args.prompt_type,
-                model_type=args.model_type,
-                raw_response=raw_response,
+                max_new_tokens=args.max_new_tokens,
             )
-        )
+            for example, raw_response in zip(batch_examples, raw_responses):
+                records.append(
+                    make_result_record(
+                        example=example,
+                        prompt_type=args.prompt_type,
+                        model_type=args.model_type,
+                        raw_response=raw_response,
+                    )
+                )
+            progress_bar.update(len(batch_examples))
 
     # File names include the condition so the four experiment outputs can share a directory.
     result_prefix = f"{args.model_type}_{args.prompt_type}"

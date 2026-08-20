@@ -19,6 +19,7 @@ if __package__ is None or __package__ == "":
 
 from src.dataset import load_tiser_dataset
 from src.model import MODEL_NAME, load_qwen_model
+from src.prompts import get_prompt_text
 
 
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
@@ -66,16 +67,6 @@ def load_test_split() -> Any:
         raise KeyError(f"TISER test split is missing required columns: {missing}")
 
     return test_dataset
-
-
-def get_prompt_text(example: dict[str, Any], prompt_type: str) -> str:
-    # Standard prompting asks the raw question. TISER prompting uses the dataset's
-    # provided prompt, which already contains the intended TISER formatting.
-    if prompt_type == "standard":
-        return str(example["question"])
-    if prompt_type == "tiser":
-        return str(example["prompt"])
-    raise ValueError(f"Unknown prompt type: {prompt_type}")
 
 
 def get_model_input_device(model: torch.nn.Module) -> torch.device:

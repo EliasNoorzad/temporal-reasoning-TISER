@@ -124,8 +124,11 @@ def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
 
 
 def normalize_for_metrics(text: Any) -> str:
-    # Keep normalization minimal: trim outside whitespace and collapse whitespace runs.
-    return " ".join(str(text).strip().split())
+    # Keep normalization minimal while making punctuation spacing consistent.
+    normalized = " ".join(str(text).strip().split())
+    normalized = re.sub(r"\s+([,.:;?!])", r"\1", normalized)
+    normalized = re.sub(r"([,.:;?!])(?=[^\s,.:;?!])", r"\1 ", normalized)
+    return normalized.strip()
 
 
 def exact_match(prediction: str, gold_answer: str) -> bool:

@@ -100,6 +100,28 @@ def load_test_split() -> Any:
     return test_dataset
 
 
+def filter_test_dataset(
+    test_dataset: Any,
+    tokenizer: Any,
+    max_input_tokens: int = 2048,
+) -> Any:
+    # Extremely long test prompts are excluded from evaluation. We keep TISER
+    # prompts up to 2048 tokens, matching the context range used in our experiments.
+    valid_indices = []
+    for i, example in enumerate(test_dataset):
+        prompt = get_prompt_text(example, "tiser")
+        prompt_length = len(
+            tokenizer(
+                prompt,
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+        if prompt_length <= max_input_tokens:
+            valid_indices.append(i)
+
+    return test_dataset.select(valid_indices)
+
+
 def get_model_input_device(model: torch.nn.Module) -> torch.device:
     if hasattr(model, "device"):
         return model.device
@@ -324,22 +346,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
     tokenizer, model = load_evaluation_model(args)
     test_dataset = load_test_split()
 
-    # Extremely long test prompts are excluded from evaluation. We keep TISER
-    # prompts up to 2048 tokens, matching the context range used in our experiments.
     original_test_examples = len(test_dataset)
-    valid_indices = []
-    for i, example in enumerate(test_dataset):
-        prompt = get_prompt_text(example, "tiser")
-        prompt_length = len(
-            tokenizer(
-                prompt,
-                add_special_tokens=False,
-            )["input_ids"]
-        )
-        if prompt_length <= 2048:
-            valid_indices.append(i)
-
-    test_dataset = test_dataset.select(valid_indices)
+    test_dataset = filter_test_dataset(test_dataset, tokenizer)
     print(f"Original test examples: {original_test_examples}")
     print(f"Test examples <= 2048 tokens: {len(test_dataset)}")
     print(f"Removed examples: {original_test_examples - len(test_dataset)}")

@@ -7,6 +7,9 @@ import json
 from typing import Any
 
 from datasets import DatasetDict, load_dataset
+from transformers import AutoTokenizer
+
+from src.model import MODEL_NAME
 
 
 DATASET_NAME = "AmazonScience/TISER"
@@ -20,13 +23,23 @@ def load_tiser_dataset() -> DatasetDict:
     return dataset
 
 
-def filter_test_dataset(
-    test_dataset: Any,
-    tokenizer: Any,
-    max_input_tokens: int = 2048,
-) -> Any:
+def load_filtered_test_dataset(max_input_tokens: int = 2048) -> Any:
+    dataset = load_tiser_dataset()
+    if "test" not in dataset:
+        raise KeyError("AmazonScience/TISER does not contain a test split.")
+
+    test_dataset = dataset["test"]
+    required_columns = {"question_id", "dataset_name", "question", "prompt", "answer"}
+    missing_columns = required_columns.difference(test_dataset.column_names)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise KeyError(f"TISER test split is missing required columns: {missing}")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
     # Extremely long test prompts are excluded from evaluation. We keep TISER
     # prompts up to 2048 tokens, matching the context range used in our experiments.
+    original_test_examples = len(test_dataset)
     valid_indices = []
     for i, example in enumerate(test_dataset):
         prompt = str(example["prompt"])
@@ -39,7 +52,11 @@ def filter_test_dataset(
         if prompt_length <= max_input_tokens:
             valid_indices.append(i)
 
-    return test_dataset.select(valid_indices)
+    filtered_dataset = test_dataset.select(valid_indices)
+    print(f"Original test examples: {original_test_examples}")
+    print(f"Test examples <= {max_input_tokens} tokens: {len(filtered_dataset)}")
+    print(f"Removed examples: {original_test_examples - len(filtered_dataset)}")
+    return filtered_dataset
 
 
 def _json_default(value: Any) -> str:

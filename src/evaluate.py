@@ -18,7 +18,7 @@ from transformers import LogitsProcessor, LogitsProcessorList
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.dataset import filter_test_dataset, load_tiser_dataset
+from src.dataset import load_filtered_test_dataset
 from src.model import MODEL_NAME, load_qwen_model
 from src.prompts import get_prompt_text
 
@@ -83,21 +83,6 @@ def load_evaluation_model(args: argparse.Namespace) -> tuple[Any, torch.nn.Modul
 
     model.eval()
     return tokenizer, model
-
-
-def load_test_split() -> Any:
-    dataset = load_tiser_dataset()
-    if "test" not in dataset:
-        raise KeyError("AmazonScience/TISER does not contain a test split.")
-
-    test_dataset = dataset["test"]
-    required_columns = {"question_id", "dataset_name", "question", "prompt", "answer"}
-    missing_columns = required_columns.difference(test_dataset.column_names)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise KeyError(f"TISER test split is missing required columns: {missing}")
-
-    return test_dataset
 
 
 def get_model_input_device(model: torch.nn.Module) -> torch.device:
@@ -322,13 +307,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer, model = load_evaluation_model(args)
-    test_dataset = load_test_split()
-
-    original_test_examples = len(test_dataset)
-    test_dataset = filter_test_dataset(test_dataset, tokenizer)
-    print(f"Original test examples: {original_test_examples}")
-    print(f"Test examples <= 2048 tokens: {len(test_dataset)}")
-    print(f"Removed examples: {original_test_examples - len(test_dataset)}")
+    test_dataset = load_filtered_test_dataset()
 
     records = []
     with tqdm(total=len(test_dataset), desc="Generating") as progress_bar:

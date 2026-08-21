@@ -324,8 +324,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
     tokenizer, model = load_evaluation_model(args)
     test_dataset = load_test_split()
 
-    # Evaluation uses the same 2048-token prompt limit as the training setup.
-    # Longer TISER prompts are removed before any prompt condition is evaluated.
+    # Extremely long test prompts are excluded from evaluation. We keep TISER
+    # prompts up to 2048 tokens, matching the context range used in our experiments.
     original_test_examples = len(test_dataset)
     valid_indices = []
     for i, example in enumerate(test_dataset):

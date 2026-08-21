@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 from datasets import DatasetDict, load_dataset
-from transformers import AutoTokenizer
 
-from src.model import MODEL_NAME
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from src.model import load_qwen_tokenizer
 
 
 DATASET_NAME = "AmazonScience/TISER"
@@ -35,7 +39,7 @@ def load_filtered_test_dataset(max_input_tokens: int = 2048) -> Any:
         missing = ", ".join(sorted(missing_columns))
         raise KeyError(f"TISER test split is missing required columns: {missing}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = load_qwen_tokenizer()
 
     # Extremely long test prompts are excluded from evaluation. We keep TISER
     # prompts up to 2048 tokens, matching the context range used in our experiments.

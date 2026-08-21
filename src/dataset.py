@@ -20,6 +20,28 @@ def load_tiser_dataset() -> DatasetDict:
     return dataset
 
 
+def filter_test_dataset(
+    test_dataset: Any,
+    tokenizer: Any,
+    max_input_tokens: int = 2048,
+) -> Any:
+    # Extremely long test prompts are excluded from evaluation. We keep TISER
+    # prompts up to 2048 tokens, matching the context range used in our experiments.
+    valid_indices = []
+    for i, example in enumerate(test_dataset):
+        prompt = str(example["prompt"])
+        prompt_length = len(
+            tokenizer(
+                prompt,
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+        if prompt_length <= max_input_tokens:
+            valid_indices.append(i)
+
+    return test_dataset.select(valid_indices)
+
+
 def _json_default(value: Any) -> str:
     """Make uncommon dataset values printable as JSON."""
     return str(value)

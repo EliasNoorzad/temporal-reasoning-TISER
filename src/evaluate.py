@@ -309,6 +309,24 @@ def run_evaluation(args: argparse.Namespace) -> None:
     tokenizer, model = load_evaluation_model(args)
     test_dataset = load_test_split()
 
+    original_test_examples = len(test_dataset)
+    valid_indices = []
+    for i, example in enumerate(test_dataset):
+        prompt = get_prompt_text(example, "tiser")
+        prompt_length = len(
+            tokenizer(
+                prompt,
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+        if prompt_length <= 2048:
+            valid_indices.append(i)
+
+    test_dataset = test_dataset.select(valid_indices)
+    print(f"Original test examples: {original_test_examples}")
+    print(f"Test examples <= 2048 tokens: {len(test_dataset)}")
+    print(f"Removed examples: {original_test_examples - len(test_dataset)}")
+
     records = []
     with tqdm(total=len(test_dataset), desc="Generating") as progress_bar:
         for batch_start in range(0, len(test_dataset), args.batch_size):

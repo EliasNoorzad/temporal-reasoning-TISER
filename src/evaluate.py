@@ -40,6 +40,8 @@ class AnswerClosingTagLogitsProcessor(LogitsProcessor):
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
     ) -> torch.FloatTensor:
+        # A normal stopping criterion would stop the whole batch at once. This
+        # instead forces only rows that already produced </answer> to emit EOS.
         for row_index in range(input_ids.shape[0]):
             continuation_ids = input_ids[row_index, self.prompt_length :]
             continuation_text = self.tokenizer.decode(
@@ -75,7 +77,8 @@ def load_evaluation_model(args: argparse.Namespace) -> tuple[Any, torch.nn.Modul
     if args.model_type == "lora":
         if not args.lora_adapter_path:
             raise ValueError("--lora-adapter-path is required when --model-type lora.")
-        # LoRA evaluation uses the same base model, with the trained adapter attached.
+        # LoRA runs use the same Qwen base model, then attach only the trained
+        # adapter weights so the base and fine-tuned conditions stay comparable.
         model = PeftModel.from_pretrained(model, args.lora_adapter_path)
 
     model.eval()
@@ -110,6 +113,8 @@ def generate_responses(
     prompt_type: str,
     max_new_tokens: int,
 ) -> list[str]:
+    # Qwen is decoder-only, so left padding keeps the end of each prompt aligned
+    # at the point where generation should begin for batched inference.
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
@@ -132,6 +137,8 @@ def generate_responses(
     if prompt_type == "tiser":
         if tokenizer.eos_token_id is None:
             raise ValueError("TISER batched stopping requires an EOS token.")
+        # The closing answer tag is ordinary text, not the model's EOS token.
+        # The logits processor finishes each completed row without stopping the rest.
         generation_args["logits_processor"] = LogitsProcessorList(
             [
                 AnswerClosingTagLogitsProcessor(
@@ -145,7 +152,8 @@ def generate_responses(
     with torch.inference_mode():
         generated_ids = model.generate(**generation_args)
 
-    # With left padding, every row shares the same padded prompt length.
+    # With left padding, the padded input length is the prompt boundary for
+    # every row, so slicing from there removes both prompt and pad tokens.
     responses = []
     for row_ids in generated_ids:
         new_token_ids = row_ids[input_length:]
@@ -154,8 +162,8 @@ def generate_responses(
 
 
 def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
-    # TISER-formatted generations are expected to put the final answer inside tags.
-    # Missing or broken tags are recorded so those cases can be inspected later.
+    # TISER output can include reasoning before the final answer. The metric
+    # should use only the text inside <answer>...</answer> when those tags exist.
     match = ANSWER_TAG_PATTERN.search(raw_response)
     has_open_tag = bool(re.search(r"<answer>", raw_response, re.IGNORECASE))
     has_close_tag = bool(re.search(r"</answer>", raw_response, re.IGNORECASE))
@@ -164,6 +172,8 @@ def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
         return match.group(1).strip(), "answer_tag_found"
 
     if prompt_type == "tiser":
+        # Missing or broken tags are kept in the result record for inspection
+        # instead of failing the whole evaluation run.
         if has_open_tag or has_close_tag:
             return raw_response.strip(), "malformed_answer_tags"
         return raw_response.strip(), "missing_answer_tags"
@@ -175,7 +185,8 @@ def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
 
 
 def normalize_for_metrics(text: Any) -> str:
-    # Keep normalization minimal while making punctuation spacing consistent.
+    # EM and token F1 should not change because a model wrote "Bristol,Connecticut"
+    # instead of "Bristol, Connecticut", but punctuation and casing are preserved.
     normalized = " ".join(str(text).strip().split())
     normalized = re.sub(r"\s+([,.:;?!])", r"\1", normalized)
     normalized = re.sub(r"([,.:;?!])(?=[^\s,.:;?!])", r"\1 ", normalized)
@@ -194,6 +205,8 @@ def tokenize_for_f1(text: Any) -> list[str]:
 
 
 def token_f1(prediction: str, gold_answer: str) -> float:
+    # Token F1 gives partial credit when the prediction overlaps with the gold
+    # answer, while exact match remains strict after the shared normalization.
     prediction_tokens = tokenize_for_f1(prediction)
     gold_tokens = tokenize_for_f1(gold_answer)
 
@@ -249,6 +262,8 @@ def to_percentage(score: float) -> float:
 
 
 def compute_macro_metrics(records: list[dict[str, Any]]) -> tuple[float, float]:
+    # The paper reports a macro average across datasets, so each dataset gets
+    # equal weight here even if it contributes a different number of examples.
     records_by_dataset: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         dataset_name = str(record["dataset_name"])
@@ -309,6 +324,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
     tokenizer, model = load_evaluation_model(args)
     test_dataset = load_test_split()
 
+    # Evaluation uses the same 2048-token prompt limit as the training setup.
+    # Longer TISER prompts are removed before any prompt condition is evaluated.
     original_test_examples = len(test_dataset)
     valid_indices = []
     for i, example in enumerate(test_dataset):
@@ -357,7 +374,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 )
             progress_bar.update(len(batch_examples))
 
-    # File names include the condition so the four experiment outputs can share a directory.
+    # Predictions stay in JSONL for per-example inspection, while the summary
+    # stores the aggregate metrics used to compare experiment conditions.
     result_prefix = f"{args.model_type}_{args.prompt_type}"
     results_path = output_dir / f"{result_prefix}_results.jsonl"
     summary_path = output_dir / f"{result_prefix}_summary.json"

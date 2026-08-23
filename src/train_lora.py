@@ -9,14 +9,23 @@ from typing import Any
 
 import torch
 from peft import LoraConfig, PeftModel
-from transformers import set_seed
+from tqdm.auto import tqdm
+from transformers import TrainerCallback, TrainerControl, TrainerState, set_seed
 from trl import SFTConfig, SFTTrainer
 
 from src.dataset import load_tiser_dataset
+from src.evaluate import (
+    compute_macro_metrics,
+    exact_match,
+    extract_prediction,
+    generate_responses,
+    token_f1,
+    to_percentage,
+)
 from src.model import MODEL_NAME, load_qwen_model
 
 
-DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/TISER/checkpoints/lora/"
+DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/TISER/checkpoints/train_lora/"
 DEFAULT_LORA_TARGET_MODULES = (
     # LoRA is applied to Qwen's attention projection layers, so the base model
     # stays frozen while these small adapter matrices learn the task.
@@ -32,13 +41,15 @@ def parse_args() -> argparse.Namespace:
         description="Run LoRA supervised fine-tuning on AmazonScience/TISER."
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--validation-ratio", type=float, required=True)
     parser.add_argument("--num-train-epochs", type=float, default=3.0)
     parser.add_argument("--per-device-train-batch-size", type=int, default=2)
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--save-total-limit", type=int, default=2)
+    parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--optim", default="adamw_torch")
@@ -62,10 +73,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def prepare_tiser_train_dataset(
-    tokenizer: Any,
-    max_seq_length: int,
-) -> Any:
+def split_tiser_train_validation(
+    validation_ratio: float,
+    seed: int,
+) -> tuple[Any, Any]:
+    if not 0 < validation_ratio < 1:
+        raise ValueError("--validation-ratio must be greater than 0 and less than 1.")
+
     dataset = load_tiser_dataset()
     if "train" not in dataset:
         raise KeyError("AmazonScience/TISER does not contain a train split.")
@@ -73,12 +87,34 @@ def prepare_tiser_train_dataset(
     train_dataset = dataset["train"]
     # In TISER, the prompt is the question/context given to the model, and the
     # output is the answer we want the model to learn to produce.
-    required_columns = {"prompt", "output"}
+    required_columns = {"prompt", "output", "answer", "dataset_name"}
     missing_columns = required_columns.difference(train_dataset.column_names)
     if missing_columns:
         missing = ", ".join(sorted(missing_columns))
         raise KeyError(f"TISER train split is missing required columns: {missing}")
 
+    # Split before tokenization so validation keeps the original fields needed
+    # for generation and metric calculation.
+    original_train_examples = len(train_dataset)
+    split_dataset = train_dataset.train_test_split(
+        test_size=validation_ratio,
+        seed=seed,
+        shuffle=True,
+    )
+    training_dataset = split_dataset["train"]
+    validation_dataset = split_dataset["test"]
+
+    print(f"Original training examples: {original_train_examples}")
+    print(f"Training examples: {len(training_dataset)}")
+    print(f"Validation examples: {len(validation_dataset)}")
+    return training_dataset, validation_dataset
+
+
+def prepare_tiser_train_dataset(
+    train_dataset: Any,
+    tokenizer: Any,
+    max_seq_length: int,
+) -> Any:
     def tokenize_prompt_completion(example: dict[str, Any]) -> dict[str, list[int]]:
         prompt = str(example["prompt"])
         completion = str(example["output"])
@@ -159,6 +195,148 @@ def print_parameter_summary(model: torch.nn.Module) -> None:
         )
 
 
+def format_epoch(epoch_value: float | None, fallback: int) -> int | float:
+    if epoch_value is None:
+        return fallback
+    rounded_epoch = round(float(epoch_value), 6)
+    if rounded_epoch.is_integer():
+        return int(rounded_epoch)
+    return rounded_epoch
+
+
+def evaluate_validation_dataset(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    validation_dataset: Any,
+    batch_size: int,
+    max_new_tokens: int,
+    epoch: int | float,
+) -> dict[str, float | int]:
+    was_training = model.training
+    model.eval()
+
+    records = []
+    try:
+        with tqdm(
+            total=len(validation_dataset),
+            desc=f"Validation epoch {epoch}",
+        ) as progress_bar:
+            for batch_start in range(0, len(validation_dataset), batch_size):
+                batch_end = min(batch_start + batch_size, len(validation_dataset))
+                batch_examples = [
+                    validation_dataset[index]
+                    for index in range(batch_start, batch_end)
+                ]
+                prompt_texts = [str(example["prompt"]) for example in batch_examples]
+                raw_responses = generate_responses(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=prompt_texts,
+                    prompt_type="tiser",
+                    max_new_tokens=max_new_tokens,
+                )
+
+                for example, raw_response in zip(batch_examples, raw_responses):
+                    prediction, _ = extract_prediction(raw_response, "tiser")
+                    gold_answer = str(example["answer"])
+                    records.append(
+                        {
+                            "dataset_name": example["dataset_name"],
+                            "exact_match": exact_match(prediction, gold_answer),
+                            "token_f1": token_f1(prediction, gold_answer),
+                        }
+                    )
+                progress_bar.update(len(batch_examples))
+    finally:
+        if was_training:
+            model.train()
+
+    if not records:
+        return {
+            "epoch": epoch,
+            "overall_em": 0.0,
+            "macro_token_f1": 0.0,
+        }
+
+    # Macro F1 is calculated by averaging F1 within each component dataset first,
+    # then averaging those dataset-level scores so each dataset has equal weight.
+    _, macro_token_f1 = compute_macro_metrics(records)
+    overall_em = sum(record["exact_match"] for record in records) / len(records)
+    return {
+        "epoch": epoch,
+        "overall_em": to_percentage(overall_em),
+        "macro_token_f1": to_percentage(macro_token_f1),
+    }
+
+
+def write_validation_metrics(
+    output_dir: Path,
+    validation_metrics: list[dict[str, float | int]],
+) -> Path:
+    output_path = output_dir / "validation_metrics.json"
+    temporary_path = output_dir / "validation_metrics.json.tmp"
+    with temporary_path.open("w", encoding="utf-8") as file:
+        json.dump(validation_metrics, file, indent=2)
+        file.write("\n")
+    temporary_path.replace(output_path)
+    return output_path
+
+
+class EpochValidationCallback(TrainerCallback):
+    def __init__(
+        self,
+        validation_dataset: Any,
+        tokenizer: Any,
+        output_dir: Path,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> None:
+        self.validation_dataset = validation_dataset
+        self.tokenizer = tokenizer
+        self.output_dir = output_dir
+        self.batch_size = batch_size
+        self.max_new_tokens = max_new_tokens
+        self.completed_epochs: set[int | float] = set()
+        self.validation_metrics: list[dict[str, float | int]] = []
+
+    def on_save(
+        self,
+        args: Any,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: Any,
+    ) -> TrainerControl:
+        if not getattr(state, "is_world_process_zero", True):
+            return control
+
+        model = kwargs.get("model")
+        if model is None:
+            return control
+
+        epoch = format_epoch(state.epoch, len(self.completed_epochs) + 1)
+        if epoch in self.completed_epochs:
+            return control
+        self.completed_epochs.add(epoch)
+
+        # Checkpoint saves happen once per epoch, so validation runs at the same
+        # boundary instead of running expensive generation every few steps.
+        print(f"\nEpoch {epoch} validation")
+        metrics = evaluate_validation_dataset(
+            model=model,
+            tokenizer=self.tokenizer,
+            validation_dataset=self.validation_dataset,
+            batch_size=self.batch_size,
+            max_new_tokens=self.max_new_tokens,
+            epoch=epoch,
+        )
+        self.validation_metrics.append(metrics)
+        metrics_path = write_validation_metrics(self.output_dir, self.validation_metrics)
+        print(f"Overall EM: {metrics['overall_em']:.2f}%")
+        print(f"Macro F1: {metrics['macro_token_f1']:.2f}%")
+        print(f"Validation metrics saved to: {metrics_path}")
+        return control
+
+
 def build_sft_config(args: argparse.Namespace, output_dir: Path) -> SFTConfig:
     # On Colab GPUs, bf16 is preferred when the hardware supports it; otherwise
     # fp16 reduces memory use compared with full float32 training.
@@ -195,6 +373,7 @@ def build_trainer(
     train_dataset: Any,
     args: argparse.Namespace,
     output_dir: Path,
+    callbacks: list[TrainerCallback] | None = None,
 ) -> SFTTrainer:
     lora_config = build_lora_config(args)
     sft_config = build_sft_config(args, output_dir)
@@ -207,17 +386,18 @@ def build_trainer(
         train_dataset=train_dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
+        callbacks=callbacks,
     )
 
 
 def save_final_adapter(trainer: SFTTrainer, tokenizer: Any, output_dir: Path) -> Path:
-    # Epoch checkpoints are useful for recovery, and final_adapter gives later
-    # scripts one predictable path to load after training finishes.
+    # Epoch checkpoints keep each training state. final_adapter is only the
+    # final training state, not a validation-selected best checkpoint.
     final_adapter_dir = output_dir / "final_adapter"
     final_adapter_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(final_adapter_dir))
     tokenizer.save_pretrained(str(final_adapter_dir))
-    print(f"Final LoRA adapter saved to: {final_adapter_dir}")
+    print(f"Final training-state LoRA adapter saved to: {final_adapter_dir}")
     return final_adapter_dir
 
 
@@ -271,6 +451,8 @@ def write_reload_verification(
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    if args.per_device_eval_batch_size < 1:
+        raise ValueError("--per-device-eval-batch-size must be at least 1.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -280,9 +462,15 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    training_dataset, validation_dataset = split_tiser_train_validation(
+        validation_ratio=args.validation_ratio,
+        seed=args.seed,
+    )
+
     # Tokenization happens before TRL so the prompt mask and answer labels stay
     # exactly as defined in this script.
     train_dataset = prepare_tiser_train_dataset(
+        train_dataset=training_dataset,
         tokenizer=tokenizer,
         max_seq_length=args.max_seq_length,
     )
@@ -303,7 +491,21 @@ def main() -> None:
     if args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    trainer = build_trainer(model, tokenizer, train_dataset, args, output_dir)
+    validation_callback = EpochValidationCallback(
+        validation_dataset=validation_dataset,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        batch_size=args.per_device_eval_batch_size,
+        max_new_tokens=args.generation_max_new_tokens,
+    )
+    trainer = build_trainer(
+        model,
+        tokenizer,
+        train_dataset,
+        args,
+        output_dir,
+        callbacks=[validation_callback],
+    )
     print_parameter_summary(trainer.model)
 
     print("Starting LoRA supervised fine-tuning.")

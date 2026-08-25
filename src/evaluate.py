@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ if __package__ is None or __package__ == "":
 
 from src.dataset import load_filtered_test_dataset
 from src.model import MODEL_NAME, load_qwen_model
-from src.prompts import get_prompt_text
+from src.prompts import extract_temporal_context, get_prompt_text
 
 
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
@@ -57,7 +58,11 @@ class AnswerClosingTagLogitsProcessor(LogitsProcessor):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Qwen on the TISER test split.")
     parser.add_argument("--model-type", choices=("base", "lora"), required=True)
-    parser.add_argument("--prompt-type", choices=("standard", "tiser"), required=True)
+    parser.add_argument(
+        "--prompt-type",
+        choices=("standard", "tiser", "both"),
+        required=True,
+    )
     parser.add_argument("--lora-adapter-path", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -143,6 +148,106 @@ def generate_responses(
     for row_ids in generated_ids:
         new_token_ids = row_ids[input_length:]
         responses.append(tokenizer.decode(new_token_ids, skip_special_tokens=True).strip())
+    return responses
+
+
+def synchronize_cuda(device: torch.device) -> None:
+    """Wait for queued GPU work so generation timing reflects actual execution."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def count_generated_tokens(
+    generated_row: torch.LongTensor,
+    input_length: int,
+    eos_token_id: int | None,
+    pad_token_id: int | None,
+) -> int:
+    """Count continuation tokens without prompt padding or trailing special tokens."""
+    token_ids = generated_row[input_length:].tolist()
+
+    # The first EOS marks the end of the model's text. Later EOS/pad values are
+    # batch padding added while other rows continue generating.
+    if eos_token_id is not None and eos_token_id in token_ids:
+        token_ids = token_ids[: token_ids.index(eos_token_id)]
+    elif pad_token_id is not None:
+        while token_ids and token_ids[-1] == pad_token_id:
+            token_ids.pop()
+
+    return len(token_ids)
+
+
+def generate_responses_with_metadata(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    prompt_texts: list[str],
+    prompt_type: str,
+    max_new_tokens: int,
+) -> list[dict[str, str | int | float]]:
+    """Generate a batch and return each response with token and timing metadata."""
+    if not prompt_texts:
+        return []
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(prompt_texts, return_tensors="pt", padding=True)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    input_length = inputs["input_ids"].shape[-1]
+    input_device = get_model_input_device(model)
+    inputs = {name: value.to(input_device) for name, value in inputs.items()}
+
+    generation_args = {
+        **inputs,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+    }
+    if tokenizer.eos_token_id is not None:
+        generation_args["pad_token_id"] = tokenizer.eos_token_id
+        generation_args["eos_token_id"] = tokenizer.eos_token_id
+    if prompt_type == "tiser":
+        if tokenizer.eos_token_id is None:
+            raise ValueError("TISER batched stopping requires an EOS token.")
+        generation_args["logits_processor"] = LogitsProcessorList(
+            [
+                AnswerClosingTagLogitsProcessor(
+                    tokenizer,
+                    input_length,
+                    tokenizer.eos_token_id,
+                )
+            ]
+        )
+
+    synchronize_cuda(input_device)
+    generation_start = time.perf_counter()
+    with torch.inference_mode():
+        generated_ids = model.generate(**generation_args)
+    synchronize_cuda(input_device)
+    batch_elapsed_seconds = time.perf_counter() - generation_start
+
+    # Batched generation does not provide independent wall-clock latency for
+    # each row, so each example records an equal share of its batch's elapsed time.
+    amortized_time_seconds = batch_elapsed_seconds / len(prompt_texts)
+    responses = []
+    for row_ids in generated_ids:
+        new_token_ids = row_ids[input_length:]
+        responses.append(
+            {
+                "response": tokenizer.decode(
+                    new_token_ids,
+                    skip_special_tokens=True,
+                ).strip(),
+                "generated_tokens": count_generated_tokens(
+                    generated_row=row_ids,
+                    input_length=input_length,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                ),
+                "inference_time_seconds": amortized_time_seconds,
+            }
+        )
     return responses
 
 
@@ -236,6 +341,44 @@ def make_result_record(
     }
 
 
+def make_combined_result_record(
+    example: dict[str, Any],
+    direct_generation: dict[str, str | int | float],
+    tiser_generation: dict[str, str | int | float],
+) -> dict[str, Any]:
+    direct_answer = str(direct_generation["response"])
+    tiser_raw_response = str(tiser_generation["response"])
+    tiser_answer, extraction_status = extract_prediction(
+        tiser_raw_response,
+        "tiser",
+    )
+    gold_answer = str(example["answer"])
+
+    return {
+        "question_id": example["question_id"],
+        "dataset_name": example["dataset_name"],
+        "question": str(example["question"]),
+        "temporal_context": extract_temporal_context(str(example["prompt"])),
+        "gold_answer": gold_answer,
+        "direct_answer": direct_answer,
+        "direct_em": exact_match(direct_answer, gold_answer),
+        "direct_f1": token_f1(direct_answer, gold_answer),
+        "direct_generated_tokens": int(direct_generation["generated_tokens"]),
+        "direct_inference_time_seconds": float(
+            direct_generation["inference_time_seconds"]
+        ),
+        "tiser_raw_response": tiser_raw_response,
+        "tiser_answer": tiser_answer,
+        "tiser_answer_extraction_status": extraction_status,
+        "tiser_em": exact_match(tiser_answer, gold_answer),
+        "tiser_f1": token_f1(tiser_answer, gold_answer),
+        "tiser_generated_tokens": int(tiser_generation["generated_tokens"]),
+        "tiser_inference_time_seconds": float(
+            tiser_generation["inference_time_seconds"]
+        ),
+    }
+
+
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as file:
         for record in records:
@@ -299,6 +442,137 @@ def write_summary(path: Path, records: list[dict[str, Any]]) -> dict[str, float 
     return summary
 
 
+def summarize_combined_branch(
+    records: list[dict[str, Any]],
+    branch_name: str,
+) -> dict[str, float | int]:
+    total_examples = len(records)
+    if total_examples == 0:
+        return {
+            f"{branch_name}_overall_em": 0.0,
+            f"{branch_name}_overall_token_f1": 0.0,
+            f"{branch_name}_macro_em": 0.0,
+            f"{branch_name}_macro_token_f1": 0.0,
+            f"{branch_name}_total_generated_tokens": 0,
+            f"{branch_name}_average_generated_tokens": 0.0,
+            f"{branch_name}_total_inference_time_seconds": 0.0,
+            f"{branch_name}_average_inference_time_seconds": 0.0,
+        }
+
+    metric_records = [
+        {
+            "dataset_name": record["dataset_name"],
+            "exact_match": record[f"{branch_name}_em"],
+            "token_f1": record[f"{branch_name}_f1"],
+        }
+        for record in records
+    ]
+    overall_em = (
+        sum(record["exact_match"] for record in metric_records) / total_examples
+    )
+    overall_token_f1 = (
+        sum(record["token_f1"] for record in metric_records) / total_examples
+    )
+    macro_em, macro_token_f1 = compute_macro_metrics(metric_records)
+    total_generated_tokens = sum(
+        int(record[f"{branch_name}_generated_tokens"])
+        for record in records
+    )
+    total_inference_time_seconds = sum(
+        float(record[f"{branch_name}_inference_time_seconds"])
+        for record in records
+    )
+
+    return {
+        f"{branch_name}_overall_em": to_percentage(overall_em),
+        f"{branch_name}_overall_token_f1": to_percentage(overall_token_f1),
+        f"{branch_name}_macro_em": to_percentage(macro_em),
+        f"{branch_name}_macro_token_f1": to_percentage(macro_token_f1),
+        f"{branch_name}_total_generated_tokens": total_generated_tokens,
+        f"{branch_name}_average_generated_tokens": (
+            total_generated_tokens / total_examples
+        ),
+        f"{branch_name}_total_inference_time_seconds": (
+            total_inference_time_seconds
+        ),
+        f"{branch_name}_average_inference_time_seconds": (
+            total_inference_time_seconds / total_examples
+        ),
+    }
+
+
+def write_combined_summary(
+    path: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, float | int]:
+    summary = {
+        "total_examples": len(records),
+        **summarize_combined_branch(records, "direct"),
+        **summarize_combined_branch(records, "tiser"),
+    }
+
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2)
+        file.write("\n")
+
+    return summary
+
+
+def run_combined_prompt_evaluation(
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    test_dataset: Any,
+) -> list[dict[str, Any]]:
+    records = []
+    with tqdm(total=len(test_dataset), desc="Generating direct and TISER") as progress_bar:
+        for batch_start in range(0, len(test_dataset), args.batch_size):
+            batch_end = min(batch_start + args.batch_size, len(test_dataset))
+            batch_examples = [
+                test_dataset[index]
+                for index in range(batch_start, batch_end)
+            ]
+            direct_prompts = [
+                get_prompt_text(example, "standard")
+                for example in batch_examples
+            ]
+            tiser_prompts = [
+                get_prompt_text(example, "tiser")
+                for example in batch_examples
+            ]
+
+            direct_generations = generate_responses_with_metadata(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_texts=direct_prompts,
+                prompt_type="standard",
+                max_new_tokens=args.max_new_tokens,
+            )
+            tiser_generations = generate_responses_with_metadata(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_texts=tiser_prompts,
+                prompt_type="tiser",
+                max_new_tokens=args.max_new_tokens,
+            )
+
+            for example, direct_generation, tiser_generation in zip(
+                batch_examples,
+                direct_generations,
+                tiser_generations,
+            ):
+                records.append(
+                    make_combined_result_record(
+                        example=example,
+                        direct_generation=direct_generation,
+                        tiser_generation=tiser_generation,
+                    )
+                )
+            progress_bar.update(len(batch_examples))
+
+    return records
+
+
 def run_evaluation(args: argparse.Namespace) -> None:
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
@@ -308,6 +582,43 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     tokenizer, model = load_evaluation_model(args)
     test_dataset = load_filtered_test_dataset()
+
+    if args.prompt_type == "both":
+        records = run_combined_prompt_evaluation(
+            args=args,
+            model=model,
+            tokenizer=tokenizer,
+            test_dataset=test_dataset,
+        )
+        result_prefix = f"{args.model_type}_both"
+        results_path = output_dir / f"{result_prefix}_results.jsonl"
+        summary_path = output_dir / f"{result_prefix}_summary.json"
+        write_jsonl(results_path, records)
+        summary = write_combined_summary(summary_path, records)
+
+        print(f"Saved predictions to: {results_path}")
+        print(f"Saved summary to: {summary_path}")
+        print(f"Direct overall EM: {summary['direct_overall_em']:.2f}%")
+        print(
+            "Direct overall token-level F1: "
+            f"{summary['direct_overall_token_f1']:.2f}%"
+        )
+        print(f"Direct macro EM: {summary['direct_macro_em']:.2f}%")
+        print(
+            "Direct macro token-level F1: "
+            f"{summary['direct_macro_token_f1']:.2f}%"
+        )
+        print(f"TISER overall EM: {summary['tiser_overall_em']:.2f}%")
+        print(
+            "TISER overall token-level F1: "
+            f"{summary['tiser_overall_token_f1']:.2f}%"
+        )
+        print(f"TISER macro EM: {summary['tiser_macro_em']:.2f}%")
+        print(
+            "TISER macro token-level F1: "
+            f"{summary['tiser_macro_token_f1']:.2f}%"
+        )
+        return
 
     records = []
     with tqdm(total=len(test_dataset), desc="Generating") as progress_bar:

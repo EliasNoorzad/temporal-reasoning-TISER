@@ -25,6 +25,14 @@ from src.prompts import extract_temporal_context, get_prompt_text
 
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
 ANSWER_CLOSING_TAG = "</answer>"
+DIRECT_LEADING_LABEL_PATTERN = re.compile(
+    r"^\s*(?:Answer|Assistant)\s*:\s*",
+    re.IGNORECASE,
+)
+DIRECT_CONTINUATION_PATTERN = re.compile(
+    r"^[ \t]*(?:Human|Assistant|Explanation|Reasoning|Rationale|Analysis)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 class AnswerClosingTagLogitsProcessor(LogitsProcessor):
@@ -93,7 +101,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lora-adapter-path", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--direct-max-new-tokens", type=int, default=128)
+    parser.add_argument("--tiser-max-new-tokens", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device-map", default="auto")
     return parser.parse_args()
@@ -265,6 +274,22 @@ def generate_responses_with_metadata(
     return responses
 
 
+def extract_direct_answer(raw_response: str) -> str:
+    """Extract a short Direct answer without using the gold answer."""
+    response = str(raw_response).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not response:
+        return ""
+
+    response = DIRECT_LEADING_LABEL_PATTERN.sub("", response, count=1).strip()
+    continuation_match = DIRECT_CONTINUATION_PATTERN.search(response)
+    if continuation_match:
+        response = response[: continuation_match.start()].rstrip()
+
+    # Direct answers in this task are short. A blank line is treated as the
+    # boundary before an additional explanation, while multiline answers stay intact.
+    return re.split(r"\n[ \t]*\n", response, maxsplit=1)[0].strip()
+
+
 def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
     # TISER output can include reasoning before the final answer. The metric
     # should use only the text inside <answer>...</answer> when those tags exist.
@@ -282,10 +307,11 @@ def extract_prediction(raw_response: str, prompt_type: str) -> tuple[str, str]:
             return raw_response.strip(), "malformed_answer_tags"
         return raw_response.strip(), "missing_answer_tags"
 
-    # Standard prompting has no tag contract, so plain generated text is acceptable.
+    # Standard prompting has no tag contract, so use its conservative text extractor.
+    direct_answer = extract_direct_answer(raw_response)
     if has_open_tag or has_close_tag:
-        return raw_response.strip(), "malformed_answer_tags"
-    return raw_response.strip(), "plain_text"
+        return direct_answer, "malformed_answer_tags"
+    return direct_answer, "plain_text"
 
 
 def normalize_for_metrics(text: Any) -> str:
@@ -360,7 +386,8 @@ def make_combined_result_record(
     direct_generation: dict[str, str | int],
     tiser_generation: dict[str, str | int],
 ) -> dict[str, Any]:
-    direct_answer = str(direct_generation["response"])
+    direct_raw_response = str(direct_generation["response"])
+    direct_answer = extract_direct_answer(direct_raw_response)
     tiser_raw_response = str(tiser_generation["response"])
     tiser_answer, extraction_status = extract_prediction(
         tiser_raw_response,
@@ -600,14 +627,14 @@ def run_combined_prompt_evaluation(
                     tokenizer=tokenizer,
                     prompt_texts=direct_prompts,
                     prompt_type="standard",
-                    max_new_tokens=args.max_new_tokens,
+                    max_new_tokens=args.direct_max_new_tokens,
                 )
                 tiser_generations = generate_responses_with_metadata(
                     model=model,
                     tokenizer=tokenizer,
                     prompt_texts=tiser_prompts,
                     prompt_type="tiser",
-                    max_new_tokens=args.max_new_tokens,
+                    max_new_tokens=args.tiser_max_new_tokens,
                 )
 
                 batch_records = []
@@ -696,7 +723,11 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 tokenizer=tokenizer,
                 prompt_texts=prompt_texts,
                 prompt_type=args.prompt_type,
-                max_new_tokens=args.max_new_tokens,
+                max_new_tokens=(
+                    args.direct_max_new_tokens
+                    if args.prompt_type == "standard"
+                    else args.tiser_max_new_tokens
+                ),
             )
             for example, raw_response in zip(batch_examples, raw_responses):
                 records.append(

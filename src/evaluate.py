@@ -31,26 +31,55 @@ class AnswerClosingTagLogitsProcessor(LogitsProcessor):
     """Finish each TISER row after its generated answer tag is complete."""
 
     def __init__(self, tokenizer: Any, prompt_length: int, eos_token_id: int) -> None:
-        self.tokenizer = tokenizer
         self.prompt_length = prompt_length
         self.eos_token_id = eos_token_id
+        closing_tag_ids = tokenizer(
+            ANSWER_CLOSING_TAG,
+            add_special_tokens=False,
+        )["input_ids"]
+        if not closing_tag_ids:
+            raise ValueError("The tokenizer produced no tokens for </answer>.")
+
+        # Verify that these IDs represent the exact literal tag before using
+        # them as a suffix of the generated continuation.
+        decoded_closing_tag = tokenizer.decode(
+            closing_tag_ids,
+            skip_special_tokens=False,
+        )
+        if decoded_closing_tag != ANSWER_CLOSING_TAG:
+            raise ValueError(
+                "The tokenizer cannot represent </answer> as an exact token suffix."
+            )
+
+        self.closing_tag_token_ids = closing_tag_ids
+        self._closing_tag_tensor: torch.Tensor | None = None
 
     def __call__(
         self,
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
     ) -> torch.FloatTensor:
-        # A normal stopping criterion would stop the whole batch at once. This
-        # instead forces only rows that already produced </answer> to emit EOS.
-        for row_index in range(input_ids.shape[0]):
-            continuation_ids = input_ids[row_index, self.prompt_length :]
-            continuation_text = self.tokenizer.decode(
-                continuation_ids,
-                skip_special_tokens=False,
+        generated_length = input_ids.shape[1] - self.prompt_length
+        closing_tag_length = len(self.closing_tag_token_ids)
+        if generated_length < closing_tag_length:
+            return scores
+
+        if (
+            self._closing_tag_tensor is None
+            or self._closing_tag_tensor.device != input_ids.device
+        ):
+            self._closing_tag_tensor = input_ids.new_tensor(
+                self.closing_tag_token_ids
             )
-            if ANSWER_CLOSING_TAG in continuation_text:
-                scores[row_index, :] = -float("inf")
-                scores[row_index, self.eos_token_id] = 0.0
+
+        # Match only the generated suffix. Completed rows emit EOS while other
+        # rows in the batch continue normally.
+        completed_rows = torch.all(
+            input_ids[:, -closing_tag_length:] == self._closing_tag_tensor,
+            dim=1,
+        )
+        scores[completed_rows, :] = -float("inf")
+        scores[completed_rows, self.eos_token_id] = 0.0
         return scores
 
 
@@ -364,6 +393,41 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    records = []
+    repair_trailing_line = False
+    last_line_ended_with_newline = True
+    with path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            last_line_ended_with_newline = line.endswith("\n")
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                if file.read().strip():
+                    raise ValueError(
+                        f"Invalid JSONL record at line {line_number} in {path}."
+                    ) from error
+                repair_trailing_line = True
+                break
+            if not isinstance(record, dict):
+                raise TypeError(
+                    f"Expected a JSON object at line {line_number} in {path}."
+                )
+            records.append(record)
+
+    # A runtime interruption can leave a partial final line or omit its newline.
+    # Rewrite only the completed records before appending resumed batches.
+    if repair_trailing_line or not last_line_ended_with_newline:
+        write_jsonl(path, records)
+
+    return records
+
+
 def to_percentage(score: float) -> float:
     return score * 100
 
@@ -490,54 +554,81 @@ def run_combined_prompt_evaluation(
     model: torch.nn.Module,
     tokenizer: Any,
     test_dataset: Any,
-) -> list[dict[str, Any]]:
-    records = []
-    with tqdm(total=len(test_dataset), desc="Generating direct and TISER") as progress_bar:
-        for batch_start in range(0, len(test_dataset), args.batch_size):
-            batch_end = min(batch_start + args.batch_size, len(test_dataset))
-            batch_examples = [
-                test_dataset[index]
-                for index in range(batch_start, batch_end)
-            ]
-            direct_prompts = [
-                get_prompt_text(example, "standard")
-                for example in batch_examples
-            ]
-            tiser_prompts = [
-                get_prompt_text(example, "tiser")
-                for example in batch_examples
-            ]
+    results_path: Path,
+) -> None:
+    existing_records = read_jsonl(results_path)
+    completed_question_ids = {
+        str(record["question_id"])
+        for record in existing_records
+    }
+    del existing_records
 
-            direct_generations = generate_responses_with_metadata(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_texts=direct_prompts,
-                prompt_type="standard",
-                max_new_tokens=args.max_new_tokens,
-            )
-            tiser_generations = generate_responses_with_metadata(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_texts=tiser_prompts,
-                prompt_type="tiser",
-                max_new_tokens=args.max_new_tokens,
-            )
+    pending_indices = []
+    completed_examples = 0
+    for index in range(len(test_dataset)):
+        question_id = str(test_dataset[index]["question_id"])
+        if question_id in completed_question_ids:
+            completed_examples += 1
+        else:
+            pending_indices.append(index)
 
-            for example, direct_generation, tiser_generation in zip(
-                batch_examples,
-                direct_generations,
-                tiser_generations,
-            ):
-                records.append(
-                    make_combined_result_record(
-                        example=example,
-                        direct_generation=direct_generation,
-                        tiser_generation=tiser_generation,
-                    )
+    with results_path.open("a", encoding="utf-8") as results_file:
+        with tqdm(
+            total=len(test_dataset),
+            initial=completed_examples,
+            desc="Generating direct and TISER",
+        ) as progress_bar:
+            for batch_start in range(0, len(pending_indices), args.batch_size):
+                batch_indices = pending_indices[
+                    batch_start : batch_start + args.batch_size
+                ]
+                batch_examples = [
+                    test_dataset[index]
+                    for index in batch_indices
+                ]
+                direct_prompts = [
+                    get_prompt_text(example, "standard")
+                    for example in batch_examples
+                ]
+                tiser_prompts = [
+                    get_prompt_text(example, "tiser")
+                    for example in batch_examples
+                ]
+
+                direct_generations = generate_responses_with_metadata(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=direct_prompts,
+                    prompt_type="standard",
+                    max_new_tokens=args.max_new_tokens,
                 )
-            progress_bar.update(len(batch_examples))
+                tiser_generations = generate_responses_with_metadata(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=tiser_prompts,
+                    prompt_type="tiser",
+                    max_new_tokens=args.max_new_tokens,
+                )
 
-    return records
+                batch_records = []
+                for example, direct_generation, tiser_generation in zip(
+                    batch_examples,
+                    direct_generations,
+                    tiser_generations,
+                ):
+                    batch_records.append(
+                        make_combined_result_record(
+                            example=example,
+                            direct_generation=direct_generation,
+                            tiser_generation=tiser_generation,
+                        )
+                    )
+                for record in batch_records:
+                    results_file.write(
+                        json.dumps(record, ensure_ascii=False, default=str) + "\n"
+                    )
+                results_file.flush()
+                progress_bar.update(len(batch_records))
 
 
 def run_evaluation(args: argparse.Namespace) -> None:
@@ -551,16 +642,17 @@ def run_evaluation(args: argparse.Namespace) -> None:
     test_dataset = load_filtered_test_dataset()
 
     if args.prompt_type == "both":
-        records = run_combined_prompt_evaluation(
+        result_prefix = f"{args.model_type}_both"
+        results_path = output_dir / f"{result_prefix}_results.jsonl"
+        summary_path = output_dir / f"{result_prefix}_summary.json"
+        run_combined_prompt_evaluation(
             args=args,
             model=model,
             tokenizer=tokenizer,
             test_dataset=test_dataset,
+            results_path=results_path,
         )
-        result_prefix = f"{args.model_type}_both"
-        results_path = output_dir / f"{result_prefix}_results.jsonl"
-        summary_path = output_dir / f"{result_prefix}_summary.json"
-        write_jsonl(results_path, records)
+        records = read_jsonl(results_path)
         summary = write_combined_summary(summary_path, records)
 
         print(f"Saved predictions to: {results_path}")

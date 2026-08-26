@@ -6,7 +6,6 @@ import argparse
 import json
 import re
 import sys
-import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -151,12 +150,6 @@ def generate_responses(
     return responses
 
 
-def synchronize_cuda(device: torch.device) -> None:
-    """Wait for queued GPU work so generation timing reflects actual execution."""
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
 def count_generated_tokens(
     generated_row: torch.LongTensor,
     input_length: int,
@@ -183,8 +176,8 @@ def generate_responses_with_metadata(
     prompt_texts: list[str],
     prompt_type: str,
     max_new_tokens: int,
-) -> list[dict[str, str | int | float]]:
-    """Generate a batch and return each response with token and timing metadata."""
+) -> list[dict[str, str | int]]:
+    """Generate a batch and return each response with its generated-token count."""
     if not prompt_texts:
         return []
 
@@ -220,16 +213,9 @@ def generate_responses_with_metadata(
             ]
         )
 
-    synchronize_cuda(input_device)
-    generation_start = time.perf_counter()
     with torch.inference_mode():
         generated_ids = model.generate(**generation_args)
-    synchronize_cuda(input_device)
-    batch_elapsed_seconds = time.perf_counter() - generation_start
 
-    # Batched generation does not provide independent wall-clock latency for
-    # each row, so each example records an equal share of its batch's elapsed time.
-    amortized_time_seconds = batch_elapsed_seconds / len(prompt_texts)
     responses = []
     for row_ids in generated_ids:
         new_token_ids = row_ids[input_length:]
@@ -245,7 +231,6 @@ def generate_responses_with_metadata(
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 ),
-                "inference_time_seconds": amortized_time_seconds,
             }
         )
     return responses
@@ -343,8 +328,8 @@ def make_result_record(
 
 def make_combined_result_record(
     example: dict[str, Any],
-    direct_generation: dict[str, str | int | float],
-    tiser_generation: dict[str, str | int | float],
+    direct_generation: dict[str, str | int],
+    tiser_generation: dict[str, str | int],
 ) -> dict[str, Any]:
     direct_answer = str(direct_generation["response"])
     tiser_raw_response = str(tiser_generation["response"])
@@ -364,18 +349,12 @@ def make_combined_result_record(
         "direct_em": exact_match(direct_answer, gold_answer),
         "direct_f1": token_f1(direct_answer, gold_answer),
         "direct_generated_tokens": int(direct_generation["generated_tokens"]),
-        "direct_inference_time_seconds": float(
-            direct_generation["inference_time_seconds"]
-        ),
         "tiser_raw_response": tiser_raw_response,
         "tiser_answer": tiser_answer,
         "tiser_answer_extraction_status": extraction_status,
         "tiser_em": exact_match(tiser_answer, gold_answer),
         "tiser_f1": token_f1(tiser_answer, gold_answer),
         "tiser_generated_tokens": int(tiser_generation["generated_tokens"]),
-        "tiser_inference_time_seconds": float(
-            tiser_generation["inference_time_seconds"]
-        ),
     }
 
 
@@ -455,8 +434,6 @@ def summarize_combined_branch(
             f"{branch_name}_macro_token_f1": 0.0,
             f"{branch_name}_total_generated_tokens": 0,
             f"{branch_name}_average_generated_tokens": 0.0,
-            f"{branch_name}_total_inference_time_seconds": 0.0,
-            f"{branch_name}_average_inference_time_seconds": 0.0,
         }
 
     metric_records = [
@@ -478,10 +455,6 @@ def summarize_combined_branch(
         int(record[f"{branch_name}_generated_tokens"])
         for record in records
     )
-    total_inference_time_seconds = sum(
-        float(record[f"{branch_name}_inference_time_seconds"])
-        for record in records
-    )
 
     return {
         f"{branch_name}_overall_em": to_percentage(overall_em),
@@ -491,12 +464,6 @@ def summarize_combined_branch(
         f"{branch_name}_total_generated_tokens": total_generated_tokens,
         f"{branch_name}_average_generated_tokens": (
             total_generated_tokens / total_examples
-        ),
-        f"{branch_name}_total_inference_time_seconds": (
-            total_inference_time_seconds
-        ),
-        f"{branch_name}_average_inference_time_seconds": (
-            total_inference_time_seconds / total_examples
         ),
     }
 

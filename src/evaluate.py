@@ -143,7 +143,16 @@ def format_prompts_for_generation(
 
     return [
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt_text}],
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return only the final answer. "
+                        "Do not provide reasoning, explanation, or intermediate steps."
+                    ),
+                },
+                {"role": "user", "content": prompt_text},
+            ],
             tokenize=False,
             add_generation_prompt=True,
         )

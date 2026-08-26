@@ -133,6 +133,24 @@ def get_model_input_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
+def format_prompts_for_generation(
+    tokenizer: Any,
+    prompt_texts: list[str],
+    prompt_type: str,
+) -> list[str]:
+    if prompt_type != "standard":
+        return prompt_texts
+
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for prompt_text in prompt_texts
+    ]
+
+
 def generate_responses(
     model: torch.nn.Module,
     tokenizer: Any,
@@ -140,12 +158,18 @@ def generate_responses(
     prompt_type: str,
     max_new_tokens: int,
 ) -> list[str]:
+    formatted_prompt_texts = format_prompts_for_generation(
+        tokenizer,
+        prompt_texts,
+        prompt_type,
+    )
+
     # Qwen is decoder-only, so left padding keeps the end of each prompt aligned
     # at the point where generation should begin for batched inference.
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
-        inputs = tokenizer(prompt_texts, return_tensors="pt", padding=True)
+        inputs = tokenizer(formatted_prompt_texts, return_tensors="pt", padding=True)
     finally:
         tokenizer.padding_side = original_padding_side
 
@@ -219,10 +243,16 @@ def generate_responses_with_metadata(
     if not prompt_texts:
         return []
 
+    formatted_prompt_texts = format_prompts_for_generation(
+        tokenizer,
+        prompt_texts,
+        prompt_type,
+    )
+
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
-        inputs = tokenizer(prompt_texts, return_tensors="pt", padding=True)
+        inputs = tokenizer(formatted_prompt_texts, return_tensors="pt", padding=True)
     finally:
         tokenizer.padding_side = original_padding_side
 

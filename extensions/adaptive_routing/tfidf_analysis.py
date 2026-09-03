@@ -119,7 +119,7 @@ def compute_features(
     similarities = linear_kernel(vectors[0:1], vectors[1:]).ravel()
     total_similarity = float(np.sum(similarities, dtype=np.float64))
 
-    if total_similarity == 0.0:
+    if total_similarity <= 1e-12:
         return {
             "tfidf_n_sentences": sentence_count,
             "tfidf_concentration": 0.0,

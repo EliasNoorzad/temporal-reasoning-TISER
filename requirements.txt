@@ -5,6 +5,8 @@ notebook
 numpy
 pandas
 peft
+scikit-learn
 torch
+tqdm
 transformers
 trl

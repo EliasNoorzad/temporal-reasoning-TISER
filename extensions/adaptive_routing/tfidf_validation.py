@@ -95,10 +95,12 @@ def get_complexity_score(
 
 
 def assign_complexity_quartiles(complexity_score: pd.Series) -> pd.Series:
-    # Ranking keeps tied values in complexity order while ensuring qcut can
-    # still produce four approximately equal groups.
-    ordered_ranks = complexity_score.rank(method="first")
-    return pd.qcut(ordered_ranks, q=4, labels=QUARTILE_LABELS)
+    return pd.qcut(
+        complexity_score,
+        q=4,
+        labels=QUARTILE_LABELS,
+        duplicates="drop",
+    )
 
 
 def calculate_quartile_summary(
@@ -147,7 +149,6 @@ def calculate_correlations(
                 "signal": signal,
                 "target": target_label,
                 "spearman_rho": float(result.statistic),
-                "p_value": float(result.pvalue),
             }
         )
     return correlations
@@ -166,8 +167,7 @@ def print_correlations(
     for correlation in correlations:
         print(
             f"{correlation['target']}: "
-            f"rho={correlation['spearman_rho']:.6f}, "
-            f"p-value={correlation['p_value']:.6g}"
+            f"rho={correlation['spearman_rho']:.6f}"
         )
 
 
@@ -221,7 +221,7 @@ def main() -> None:
     correlation_path = args.output_dir / "tfidf_validation_correlations.csv"
     pd.DataFrame(
         correlation_rows,
-        columns=("signal", "target", "spearman_rho", "p_value"),
+        columns=("signal", "target", "spearman_rho"),
     ).to_csv(correlation_path, index=False)
 
     print("\nSaved outputs:")

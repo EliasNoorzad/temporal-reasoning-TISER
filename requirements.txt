@@ -6,6 +6,7 @@ numpy
 pandas
 peft
 scikit-learn
+scipy
 torch
 tqdm
 transformers

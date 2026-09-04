@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from statistics import fmean
 import sys
@@ -18,11 +19,13 @@ if __package__ is None or __package__ == "":
 
 from src.dataset import load_tiser_dataset
 from src.evaluate import (
+    exact_match,
     format_prompts_for_generation,
     generate_responses_with_metadata,
     load_evaluation_model,
     make_combined_result_record,
     to_percentage,
+    token_f1,
 )
 from src.model import MODEL_NAME
 from src.prompts import (
@@ -232,6 +235,54 @@ def token_saving_percentage(full_tokens: float, filtered_tokens: float) -> float
     return (1.0 - filtered_tokens / full_tokens) * 100.0 if full_tokens else 0.0
 
 
+# Keep this identical to the final normalize_answer pass in notebooks/run_test_lora.ipynb.
+def normalize_answer(prediction, gold_answer):
+    prediction = str(prediction).strip()
+    gold_answer = str(gold_answer).strip()
+
+    # Duration questions:
+    # "1" and "1 year" should be treated equivalently.
+    if re.search(r"\s+years?$", gold_answer, flags=re.IGNORECASE):
+        prediction = re.sub(
+            r"\s+years?$",
+            "",
+            prediction,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        gold_answer = re.sub(
+            r"\s+years?$",
+            "",
+            gold_answer,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    # Event-boundary questions:
+    # "(event)" and "(event) starts/ends" should be treated equivalently.
+    if re.search(r"\s+(starts|ends)$", gold_answer, flags=re.IGNORECASE):
+        prediction = re.sub(
+            r"\s+(starts|ends)$",
+            "",
+            prediction,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        gold_answer = re.sub(
+            r"\s+(starts|ends)$",
+            "",
+            gold_answer,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if prediction.startswith("(") and prediction.endswith(")"):
+            prediction = prediction[1:-1].strip()
+
+        if gold_answer.startswith("(") and gold_answer.endswith(")"):
+            gold_answer = gold_answer[1:-1].strip()
+
+    return prediction, gold_answer
+
+
 def make_filtered_result(
     record: dict[str, Any], filtered_prompt: str,
     direct_generation: dict[str, Any], tiser_generation: dict[str, Any],
@@ -244,6 +295,13 @@ def make_filtered_result(
         "answer": record["gold_answer"],
     }
     evaluated = make_combined_result_record(example, direct_generation, tiser_generation)
+    # Rescore extracted answers with the notebook's final pass; preserve their text.
+    for branch in ("direct", "tiser"):
+        normalized_prediction, normalized_gold = normalize_answer(
+            evaluated[f"{branch}_answer"], record["gold_answer"]
+        )
+        evaluated[f"{branch}_em"] = exact_match(normalized_prediction, normalized_gold)
+        evaluated[f"{branch}_f1"] = token_f1(normalized_prediction, normalized_gold)
     result = dict(record)
     result.update({f"filtered_{field}": evaluated[field] for field in BRANCH_RESULT_FIELDS})
     for branch in ("direct", "tiser"):

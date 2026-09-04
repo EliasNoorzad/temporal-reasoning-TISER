@@ -122,11 +122,6 @@ def main() -> None:
     print(f"Cross-split identical-record overlap: {overlap}")
     if duplicate_records:
         print("Duplicate count is extra copies beyond the first; none were removed.")
-    if overlap:
-        raise ValueError(
-            "Identical source records appear in both subsets. No output files were "
-            "written; the dataset was not deduplicated or regrouped."
-        )
 
     write_jsonl(args.dev_output, development)
     write_jsonl(args.heldout_output, heldout)

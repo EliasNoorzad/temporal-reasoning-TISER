@@ -235,6 +235,26 @@ def prepare_complexity_records(
     return prepared_records
 
 
+def prepare_full_records(
+    full_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    has_source_row_id = [SOURCE_ROW_ID_FIELD in record for record in full_records]
+    if any(has_source_row_id) and not all(has_source_row_id):
+        raise ValueError(
+            "source_row_id must be present in every full-input record or omitted "
+            "from all full-input records."
+        )
+    if all(has_source_row_id):
+        return full_records
+
+    prepared_records = []
+    for row_index, record in enumerate(full_records):
+        prepared_record = dict(record)
+        prepared_record[SOURCE_ROW_ID_FIELD] = row_index
+        prepared_records.append(prepared_record)
+    return prepared_records
+
+
 def validate_key_sets(
     reference: dict[int, dict[str, Any]],
     inputs: dict[str, dict[int, dict[str, Any]]],
@@ -574,8 +594,9 @@ def main() -> None:
     full_record_list = load_jsonl(
         args.full_input,
         "full input",
-        (SOURCE_ROW_ID_FIELD, *FULL_FIELDS),
+        FULL_FIELDS,
     )
+    full_record_list = prepare_full_records(full_record_list)
     keys, full_records = map_by_source_row_id(full_record_list, "full input")
 
     complexity_record_list = load_jsonl(

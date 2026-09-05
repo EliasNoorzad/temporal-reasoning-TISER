@@ -18,7 +18,8 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 
-OUTPUT_FIELDS = (
+SOURCE_ROW_ID_FIELD = "source_row_id"
+FILTER_OUTPUT_FIELDS = (
     "context_filter_top_k",
     "original_context_sentences",
     "filtered_context_sentences",
@@ -27,6 +28,7 @@ OUTPUT_FIELDS = (
     "context_token_saving_pct",
     "filtered_temporal_context",
 )
+OUTPUT_FIELDS = (SOURCE_ROW_ID_FIELD, *FILTER_OUTPUT_FIELDS)
 SUMMARY_FIELDS = (
     "original_context_sentences",
     "filtered_context_sentences",
@@ -90,7 +92,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
                     raise KeyError(f"Line {line_number} is missing field: {field}")
                 if not isinstance(record[field], str):
                     raise TypeError(f"Line {line_number}: {field} must be a string.")
-            collisions = set(OUTPUT_FIELDS).intersection(record)
+            collisions = set(FILTER_OUTPUT_FIELDS).intersection(record)
             if collisions:
                 raise ValueError(
                     f"Line {line_number} already contains output fields: "
@@ -100,6 +102,37 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not records:
         raise ValueError("Input JSONL contains no examples.")
     return records
+
+
+def assign_source_row_ids(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    has_source_row_id = [SOURCE_ROW_ID_FIELD in record for record in records]
+    if any(has_source_row_id) and not all(has_source_row_id):
+        raise ValueError(
+            "source_row_id must be present in every input record or omitted from all records."
+        )
+
+    prepared_records = []
+    seen_ids = set()
+    for row_index, record in enumerate(records):
+        source_row_id = record.get(SOURCE_ROW_ID_FIELD, row_index)
+        if (
+            isinstance(source_row_id, bool)
+            or not isinstance(source_row_id, int)
+            or source_row_id < 0
+        ):
+            raise ValueError(
+                f"Input record {row_index + 1}: source_row_id must be a "
+                "non-negative integer."
+            )
+        if source_row_id in seen_ids:
+            raise ValueError(f"Duplicate source_row_id in input: {source_row_id}")
+        seen_ids.add(source_row_id)
+        prepared_record = dict(record)
+        prepared_record[SOURCE_ROW_ID_FIELD] = source_row_id
+        prepared_records.append(prepared_record)
+    return prepared_records
 
 
 def split_context_sentences(text: str) -> list[str]:
@@ -214,7 +247,7 @@ def main() -> None:
     if args.summary_output is not None:
         paths.append(args.summary_output)
     validate_paths(paths)
-    records = load_jsonl(args.input)
+    records = assign_source_row_ids(load_jsonl(args.input))
     context_sentences_by_example = [
         split_context_sentences(record["temporal_context"])
         for record in tqdm(records, desc="Splitting context sentences", unit="examples")

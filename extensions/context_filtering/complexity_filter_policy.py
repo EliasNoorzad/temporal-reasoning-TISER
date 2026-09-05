@@ -1,4 +1,4 @@
-"""Evaluate offline context-filtering policies on development-set results."""
+"""Evaluate offline context-filtering policies on aligned full-test results."""
 
 from __future__ import annotations
 
@@ -15,7 +15,14 @@ import pandas as pd
 
 
 THRESHOLDS = [3, 4, 5, 6, 7, 8, 9, 10, 12]
-KEY_FIELDS = ("question_id", "dataset_name")
+SOURCE_ROW_ID_FIELD = "source_row_id"
+IDENTITY_FIELDS = (
+    "question_id",
+    "dataset_name",
+    "question",
+    "temporal_context",
+    "gold_answer",
+)
 COMPLEXITY_FIELD = "tfidf_effective_evidence_count"
 FULL_FIELDS = (
     "direct_em",
@@ -114,20 +121,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def canonical_key(record: dict[str, Any]) -> tuple[str, str]:
-    return tuple(
-        json.dumps(record[field], sort_keys=True, ensure_ascii=False)
-        for field in KEY_FIELDS
-    )
-
-
 def load_jsonl(
     path: Path,
     name: str,
     required_fields: tuple[str, ...],
-) -> tuple[list[tuple[str, str]], dict[tuple[str, str], dict[str, Any]]]:
-    keys = []
-    records = {}
+) -> list[dict[str, Any]]:
+    records = []
     with path.open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
             if not line.strip():
@@ -140,28 +139,105 @@ def load_jsonl(
                 ) from error
             if not isinstance(record, dict):
                 raise TypeError(f"Expected a JSON object at line {line_number} in {name}.")
-            missing = set(KEY_FIELDS + required_fields).difference(record)
+            missing = set(required_fields).difference(record)
             if missing:
                 raise KeyError(
                     f"{name} line {line_number} is missing: "
                     f"{', '.join(sorted(missing))}"
                 )
-            key = canonical_key(record)
-            if key in records:
-                raise ValueError(
-                    f"Duplicate (question_id, dataset_name) key in {name} "
-                    f"at line {line_number}: {key}"
-                )
-            keys.append(key)
-            records[key] = record
+            records.append(record)
     if not records:
         raise ValueError(f"{name} contains no records: {path}")
-    return keys, records
+    return records
+
+
+def source_row_id(record: dict[str, Any], name: str, line_number: int) -> int:
+    value = record.get(SOURCE_ROW_ID_FIELD)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{name} line {line_number}: source_row_id must be a non-negative integer."
+        )
+    return value
+
+
+def map_by_source_row_id(
+    records: list[dict[str, Any]],
+    name: str,
+) -> tuple[list[int], dict[int, dict[str, Any]]]:
+    keys = []
+    mapped_records = {}
+    for line_number, record in enumerate(records, start=1):
+        key = source_row_id(record, name, line_number)
+        if key in mapped_records:
+            raise ValueError(
+                f"Duplicate source_row_id in {name} at line {line_number}: {key}"
+            )
+        keys.append(key)
+        mapped_records[key] = record
+    return keys, mapped_records
+
+
+def canonical_value(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def validate_rowwise_complexity_alignment(
+    complexity_records: list[dict[str, Any]],
+    full_records: list[dict[str, Any]],
+) -> None:
+    if len(complexity_records) != len(full_records):
+        raise ValueError(
+            "Complexity input has no source_row_id and cannot be aligned by row: "
+            f"it contains {len(complexity_records)} records, while the full input "
+            f"contains {len(full_records)}."
+        )
+    for row_index, (complexity_record, full_record) in enumerate(
+        zip(complexity_records, full_records, strict=True)
+    ):
+        for field in IDENTITY_FIELDS:
+            if field not in complexity_record or field not in full_record:
+                continue
+            if canonical_value(complexity_record[field]) != canonical_value(
+                full_record[field]
+            ):
+                raise ValueError(
+                    "Complexity input cannot be aligned by row because "
+                    f"{field} differs at zero-based row {row_index}."
+                )
+
+
+def prepare_complexity_records(
+    complexity_records: list[dict[str, Any]],
+    full_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    has_source_row_id = [
+        SOURCE_ROW_ID_FIELD in record for record in complexity_records
+    ]
+    if any(has_source_row_id) and not all(has_source_row_id):
+        raise ValueError(
+            "source_row_id must be present in every complexity record or omitted "
+            "from all complexity records."
+        )
+    if all(has_source_row_id):
+        return complexity_records
+
+    validate_rowwise_complexity_alignment(complexity_records, full_records)
+    prepared_records = []
+    for row_index, record in enumerate(complexity_records):
+        prepared_record = dict(record)
+        prepared_record[SOURCE_ROW_ID_FIELD] = row_index
+        prepared_records.append(prepared_record)
+    return prepared_records
 
 
 def validate_key_sets(
-    reference: dict[tuple[str, str], dict[str, Any]],
-    inputs: dict[str, dict[tuple[str, str], dict[str, Any]]],
+    reference: dict[int, dict[str, Any]],
+    inputs: dict[str, dict[int, dict[str, Any]]],
 ) -> None:
     reference_keys = set(reference)
     for name, records in inputs.items():
@@ -170,17 +246,40 @@ def validate_key_sets(
         extra = current_keys - reference_keys
         if missing or extra:
             raise ValueError(
-                f"Key mismatch for {name}: {len(missing)} missing and "
-                f"{len(extra)} extra keys. Missing sample: {list(missing)[:3]}; "
+                f"source_row_id mismatch for {name}: {len(missing)} missing and "
+                f"{len(extra)} extra IDs. Missing sample: {list(missing)[:3]}; "
                 f"extra sample: {list(extra)[:3]}"
             )
+
+
+def validate_identity_consistency(
+    keys: list[int],
+    inputs: dict[str, dict[int, dict[str, Any]]],
+) -> None:
+    for key in keys:
+        for field in IDENTITY_FIELDS:
+            available = [
+                (name, records[key][field])
+                for name, records in inputs.items()
+                if field in records[key]
+            ]
+            if len(available) < 2:
+                continue
+            expected_name, expected_value = available[0]
+            expected = canonical_value(expected_value)
+            for current_name, current_value in available[1:]:
+                if canonical_value(current_value) != expected:
+                    raise ValueError(
+                        f"Identity mismatch for source_row_id {key}: field {field} "
+                        f"differs between {expected_name} and {current_name}."
+                    )
 
 
 def numeric_value(
     record: dict[str, Any],
     field: str,
     source_name: str,
-    key: tuple[str, str],
+    key: int,
 ) -> float:
     try:
         value = float(record[field])
@@ -196,7 +295,7 @@ def numeric_value(
 
 
 def validate_top_k(
-    records: dict[tuple[str, str], dict[str, Any]],
+    records: dict[int, dict[str, Any]],
     expected_top_k: int,
     source_name: str,
 ) -> None:
@@ -211,8 +310,8 @@ def validate_top_k(
 
 
 def values_for(
-    keys: list[tuple[str, str]],
-    records: dict[tuple[str, str], dict[str, Any]],
+    keys: list[int],
+    records: dict[int, dict[str, Any]],
     field: str,
     source_name: str,
 ) -> np.ndarray:
@@ -223,9 +322,9 @@ def values_for(
 
 
 def resolve_full_input_tokens(
-    keys: list[tuple[str, str]],
-    full_records: dict[tuple[str, str], dict[str, Any]],
-    filtered_records: dict[str, dict[tuple[str, str], dict[str, Any]]],
+    keys: list[int],
+    full_records: dict[int, dict[str, Any]],
+    filtered_records: dict[str, dict[int, dict[str, Any]]],
     branch: str,
 ) -> np.ndarray:
     field = f"{branch}_full_input_tokens"
@@ -255,9 +354,9 @@ def resolve_full_input_tokens(
 
 
 def build_metrics(
-    keys: list[tuple[str, str]],
-    full_records: dict[tuple[str, str], dict[str, Any]],
-    filtered_records: dict[str, dict[tuple[str, str], dict[str, Any]]],
+    keys: list[int],
+    full_records: dict[int, dict[str, Any]],
+    filtered_records: dict[str, dict[int, dict[str, Any]]],
 ) -> dict[str, dict[str, BranchMetrics]]:
     metrics: dict[str, dict[str, BranchMetrics]] = {"full": {}}
     for branch in ("direct", "tiser"):
@@ -472,12 +571,26 @@ def main() -> None:
             args.pareto_output,
         ]
     )
-    keys, complexity_records = load_jsonl(
+    full_record_list = load_jsonl(
+        args.full_input,
+        "full input",
+        (SOURCE_ROW_ID_FIELD, *FULL_FIELDS),
+    )
+    keys, full_records = map_by_source_row_id(full_record_list, "full input")
+
+    complexity_record_list = load_jsonl(
         args.complexity_input,
         "complexity input",
         (COMPLEXITY_FIELD,),
     )
-    _, full_records = load_jsonl(args.full_input, "full input", FULL_FIELDS)
+    complexity_record_list = prepare_complexity_records(
+        complexity_record_list,
+        full_record_list,
+    )
+    _, complexity_records = map_by_source_row_id(
+        complexity_record_list,
+        "complexity input",
+    )
     filtered_records = {}
     filtered_paths = {
         "top3": args.top3_input,
@@ -485,13 +598,26 @@ def main() -> None:
         "top7": args.top7_input,
     }
     for setting, path in filtered_paths.items():
-        _, records = load_jsonl(path, setting, FILTERED_FIELDS)
+        record_list = load_jsonl(
+            path,
+            setting,
+            (SOURCE_ROW_ID_FIELD, *FILTERED_FIELDS),
+        )
+        _, records = map_by_source_row_id(record_list, setting)
         validate_top_k(records, int(setting.removeprefix("top")), setting)
         filtered_records[setting] = records
 
     validate_key_sets(
-        complexity_records,
-        {"full input": full_records, **filtered_records},
+        full_records,
+        {"complexity input": complexity_records, **filtered_records},
+    )
+    validate_identity_consistency(
+        keys,
+        {
+            "complexity input": complexity_records,
+            "full input": full_records,
+            **filtered_records,
+        },
     )
     complexity = values_for(
         keys,
@@ -518,8 +644,8 @@ def main() -> None:
     pareto.to_csv(args.pareto_output, index=False)
 
     baselines = baseline_values(metrics)
-    print(f"Development examples: {len(keys)}")
-    print(f"Threshold triples evaluated: {len(sweep)}")
+    print(f"Number of aligned examples: {len(keys)}")
+    print(f"Number of threshold triples: {len(sweep)}")
     print(
         "Full-context Direct: "
         f"EM {baselines['direct_full_baseline_em']:.2f}%, "

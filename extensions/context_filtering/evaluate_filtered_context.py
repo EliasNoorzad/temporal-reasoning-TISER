@@ -37,7 +37,7 @@ from src.prompts import (
 
 
 REQUIRED_FIELDS = (
-    "question", "temporal_context", "filtered_temporal_context", "gold_answer",
+    "source_row_id", "question", "temporal_context", "filtered_temporal_context", "gold_answer",
     "original_context_tokens", "filtered_context_tokens",
     "context_token_saving_pct", "context_filter_top_k",
 )
@@ -94,6 +94,7 @@ def validate_paths(paths: list[Path]) -> None:
 def load_input_records(path: Path) -> list[dict[str, Any]]:
     # The evaluator's resume reader can repair files; the source here stays read-only.
     records = []
+    seen_source_row_ids = set()
     with path.open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
             if not line.strip():
@@ -116,6 +117,20 @@ def load_input_records(path: Path) -> list[dict[str, Any]]:
             for field in ("question", "temporal_context", "filtered_temporal_context"):
                 if not isinstance(record[field], str):
                     raise TypeError(f"Line {line_number}: {field} must be a string.")
+            source_row_id = record["source_row_id"]
+            if (
+                isinstance(source_row_id, bool)
+                or not isinstance(source_row_id, int)
+                or source_row_id < 0
+            ):
+                raise ValueError(
+                    f"Line {line_number}: source_row_id must be a non-negative integer."
+                )
+            if source_row_id in seen_source_row_ids:
+                raise ValueError(
+                    f"Line {line_number}: duplicate source_row_id {source_row_id}."
+                )
+            seen_source_row_ids.add(source_row_id)
             top_k = record["context_filter_top_k"]
             if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
                 raise ValueError(f"Line {line_number}: context_filter_top_k must be a positive integer.")
@@ -470,11 +485,20 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     strict=True,
                 )
             ]
+            expected_ids = [record["source_row_id"] for record in batch]
+            output_ids = [result["source_row_id"] for result in batch_results]
+            if output_ids != expected_ids:
+                raise RuntimeError("Filtered evaluation changed the input record order.")
             for result in batch_results:
                 file.write(json.dumps(result, ensure_ascii=False) + "\n")
             file.flush()
             results.extend(batch_results)
             progress.update(len(batch_results))
+
+    if [result["source_row_id"] for result in results] != [
+        record["source_row_id"] for record in records
+    ]:
+        raise RuntimeError("Filtered evaluation changed the input record order.")
 
     summary = summarize_results(results)
     summary["configuration"] = {

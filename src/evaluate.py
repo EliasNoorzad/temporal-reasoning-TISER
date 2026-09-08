@@ -112,12 +112,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--rescore-existing", type=Path)
+    parser.add_argument("--output-rescored-results", type=Path)
     parser.add_argument("--output-summary", type=Path)
     args = parser.parse_args()
 
     if args.rescore_existing is not None:
-        if args.output_summary is None:
-            parser.error("--rescore-existing requires --output-summary.")
+        missing = [
+            option
+            for option, value in (
+                ("--output-rescored-results", args.output_rescored_results),
+                ("--output-summary", args.output_summary),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "--rescore-existing requires: "
+                f"{', '.join(missing)}"
+            )
     else:
         missing = [
             option
@@ -813,17 +825,25 @@ def write_combined_summary(
 
 
 def run_existing_results_rescore(args: argparse.Namespace) -> None:
-    if args.rescore_existing.resolve() == args.output_summary.resolve():
+    resolved_paths = {
+        args.rescore_existing.resolve(),
+        args.output_rescored_results.resolve(),
+        args.output_summary.resolve(),
+    }
+    if len(resolved_paths) != 3:
         raise ValueError(
-            "--output-summary must differ from --rescore-existing so predictions "
-            "remain unchanged."
+            "--rescore-existing, --output-rescored-results, and --output-summary "
+            "must refer to different files."
         )
     records = read_jsonl_read_only(args.rescore_existing)
     rescored_records = rescore_combined_records(records)
+    args.output_rescored_results.parent.mkdir(parents=True, exist_ok=True)
     args.output_summary.parent.mkdir(parents=True, exist_ok=True)
+    write_jsonl(args.output_rescored_results, rescored_records)
     summary = write_combined_summary(args.output_summary, rescored_records)
 
     print(f"Rescored existing predictions: {args.rescore_existing}")
+    print(f"Saved rescored predictions to: {args.output_rescored_results}")
     print(f"Saved corrected summary to: {args.output_summary}")
     for branch_name, label in (("direct", "Direct"), ("tiser", "TISER")):
         print(f"{label} five-dataset Macro EM: {summary[f'{branch_name}_macro_em']:.2f}%")

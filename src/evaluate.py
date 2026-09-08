@@ -33,6 +33,13 @@ DIRECT_CONTINUATION_PATTERN = re.compile(
     r"^[ \t]*(?:Human|Assistant|Explanation|Reasoning|Rationale|Analysis)\s*:",
     re.IGNORECASE | re.MULTILINE,
 )
+IN_DOMAIN_DATASETS = (
+    "tgqa_test",
+    "tempreason_l2_test",
+    "tempreason_l3_test",
+    "timeqa_easy_test",
+    "timeqa_hard_test",
+)
 
 
 class AnswerClosingTagLogitsProcessor(LogitsProcessor):
@@ -93,19 +100,37 @@ class AnswerClosingTagLogitsProcessor(LogitsProcessor):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Qwen on the TISER test split.")
-    parser.add_argument("--model-type", choices=("base", "lora"), required=True)
+    parser.add_argument("--model-type", choices=("base", "lora"))
     parser.add_argument(
         "--prompt-type",
         choices=("standard", "tiser", "both"),
-        required=True,
     )
     parser.add_argument("--lora-adapter-path", default=None)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--output-dir")
     parser.add_argument("--direct-max-new-tokens", type=int, default=128)
     parser.add_argument("--tiser-max-new-tokens", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device-map", default="auto")
-    return parser.parse_args()
+    parser.add_argument("--rescore-existing", type=Path)
+    parser.add_argument("--output-summary", type=Path)
+    args = parser.parse_args()
+
+    if args.rescore_existing is not None:
+        if args.output_summary is None:
+            parser.error("--rescore-existing requires --output-summary.")
+    else:
+        missing = [
+            option
+            for option, value in (
+                ("--model-type", args.model_type),
+                ("--prompt-type", args.prompt_type),
+                ("--output-dir", args.output_dir),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(f"the following arguments are required: {', '.join(missing)}")
+    return args
 
 
 def load_evaluation_model(args: argparse.Namespace) -> tuple[Any, torch.nn.Module]:
@@ -362,8 +387,57 @@ def normalize_for_metrics(text: Any) -> str:
     return normalized.strip()
 
 
+def normalize_answer(prediction: Any, gold_answer: Any) -> tuple[str, str]:
+    prediction = str(prediction).strip()
+    gold_answer = str(gold_answer).strip()
+
+    if re.search(r"\s+years?$", gold_answer, flags=re.IGNORECASE):
+        prediction = re.sub(
+            r"\s+years?$",
+            "",
+            prediction,
+            flags=re.IGNORECASE,
+        ).strip()
+        gold_answer = re.sub(
+            r"\s+years?$",
+            "",
+            gold_answer,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    if re.search(r"\s+(starts|ends)$", gold_answer, flags=re.IGNORECASE):
+        prediction = re.sub(
+            r"\s+(starts|ends)$",
+            "",
+            prediction,
+            flags=re.IGNORECASE,
+        ).strip()
+        gold_answer = re.sub(
+            r"\s+(starts|ends)$",
+            "",
+            gold_answer,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if prediction.startswith("(") and prediction.endswith(")"):
+            prediction = prediction[1:-1].strip()
+        if gold_answer.startswith("(") and gold_answer.endswith(")"):
+            gold_answer = gold_answer[1:-1].strip()
+
+    return prediction, gold_answer
+
+
+def normalize_metric_pair(prediction: Any, gold_answer: Any) -> tuple[str, str]:
+    prediction, gold_answer = normalize_answer(prediction, gold_answer)
+    return normalize_for_metrics(prediction), normalize_for_metrics(gold_answer)
+
+
 def exact_match(prediction: str, gold_answer: str) -> bool:
-    return normalize_for_metrics(prediction) == normalize_for_metrics(gold_answer)
+    normalized_prediction, normalized_gold = normalize_metric_pair(
+        prediction,
+        gold_answer,
+    )
+    return normalized_prediction == normalized_gold
 
 
 def tokenize_for_f1(text: Any) -> list[str]:
@@ -376,8 +450,12 @@ def tokenize_for_f1(text: Any) -> list[str]:
 def token_f1(prediction: str, gold_answer: str) -> float:
     # Token F1 gives partial credit when the prediction overlaps with the gold
     # answer, while exact match remains strict after the shared normalization.
-    prediction_tokens = tokenize_for_f1(prediction)
-    gold_tokens = tokenize_for_f1(gold_answer)
+    normalized_prediction, normalized_gold = normalize_metric_pair(
+        prediction,
+        gold_answer,
+    )
+    prediction_tokens = tokenize_for_f1(normalized_prediction)
+    gold_tokens = tokenize_for_f1(normalized_gold)
 
     if not prediction_tokens and not gold_tokens:
         return 1.0
@@ -494,21 +572,98 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def read_jsonl_read_only(path: Path) -> list[dict[str, Any]]:
+    records = []
+    with path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSONL record at line {line_number} in {path}."
+                ) from error
+            if not isinstance(record, dict):
+                raise TypeError(
+                    f"Expected a JSON object at line {line_number} in {path}."
+                )
+            records.append(record)
+    if not records:
+        raise ValueError(f"Existing results file contains no records: {path}")
+    return records
+
+
+def rescore_combined_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    required_fields = (
+        "dataset_name",
+        "gold_answer",
+        "direct_answer",
+        "direct_generated_tokens",
+        "tiser_answer",
+        "tiser_generated_tokens",
+    )
+    rescored_records = []
+    for record_number, record in enumerate(records, start=1):
+        missing_fields = set(required_fields).difference(record)
+        if missing_fields:
+            raise KeyError(
+                f"Existing result {record_number} is missing fields: "
+                f"{', '.join(sorted(missing_fields))}"
+            )
+        rescored_record = dict(record)
+        gold_answer = record["gold_answer"]
+        for branch_name in ("direct", "tiser"):
+            prediction = record[f"{branch_name}_answer"]
+            rescored_record[f"{branch_name}_em"] = exact_match(
+                prediction,
+                gold_answer,
+            )
+            rescored_record[f"{branch_name}_f1"] = token_f1(
+                prediction,
+                gold_answer,
+            )
+        rescored_records.append(rescored_record)
+    return rescored_records
+
+
 def to_percentage(score: float) -> float:
     return score * 100
 
 
-def compute_macro_metrics(records: list[dict[str, Any]]) -> tuple[float, float]:
-    # The paper reports a macro average across datasets, so each dataset gets
-    # equal weight here even if it contributes a different number of examples.
-    records_by_dataset: dict[str, list[dict[str, Any]]] = {}
+def group_in_domain_records(
+    records: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    records_by_dataset = {dataset_name: [] for dataset_name in IN_DOMAIN_DATASETS}
     for record in records:
         dataset_name = str(record["dataset_name"])
-        records_by_dataset.setdefault(dataset_name, []).append(record)
+        if dataset_name in records_by_dataset:
+            records_by_dataset[dataset_name].append(record)
+
+    missing_datasets = [
+        dataset_name
+        for dataset_name, dataset_records in records_by_dataset.items()
+        if not dataset_records
+    ]
+    if missing_datasets:
+        raise ValueError(
+            "Cannot compute five-dataset macro metrics. Missing datasets: "
+            f"{', '.join(missing_datasets)}"
+        )
+    return records_by_dataset
+
+
+def compute_macro_metrics(records: list[dict[str, Any]]) -> tuple[float, float]:
+    # The paper's main macro average gives equal weight to its five in-domain
+    # datasets. ToT predictions remain saved but are excluded from this score.
+    records_by_dataset = group_in_domain_records(records)
 
     dataset_em_scores = []
     dataset_f1_scores = []
-    for dataset_records in records_by_dataset.values():
+    for dataset_name in IN_DOMAIN_DATASETS:
+        dataset_records = records_by_dataset[dataset_name]
         dataset_total = len(dataset_records)
         dataset_em_scores.append(
             sum(record["exact_match"] for record in dataset_records) / dataset_total
@@ -564,6 +719,8 @@ def summarize_combined_branch(
             f"{branch_name}_macro_token_f1": 0.0,
             f"{branch_name}_total_generated_tokens": 0,
             f"{branch_name}_average_generated_tokens": 0.0,
+            f"{branch_name}_in_domain_total_generated_tokens": 0,
+            f"{branch_name}_in_domain_average_generated_tokens": 0.0,
         }
 
     metric_records = [
@@ -585,6 +742,15 @@ def summarize_combined_branch(
         int(record[f"{branch_name}_generated_tokens"])
         for record in records
     )
+    in_domain_records = [
+        record
+        for record in records
+        if str(record["dataset_name"]) in IN_DOMAIN_DATASETS
+    ]
+    in_domain_total_generated_tokens = sum(
+        int(record[f"{branch_name}_generated_tokens"])
+        for record in in_domain_records
+    )
 
     return {
         f"{branch_name}_overall_em": to_percentage(overall_em),
@@ -595,17 +761,48 @@ def summarize_combined_branch(
         f"{branch_name}_average_generated_tokens": (
             total_generated_tokens / total_examples
         ),
+        f"{branch_name}_in_domain_total_generated_tokens": (
+            in_domain_total_generated_tokens
+        ),
+        f"{branch_name}_in_domain_average_generated_tokens": (
+            in_domain_total_generated_tokens / len(in_domain_records)
+        ),
     }
+
+
+def compute_combined_per_dataset_metrics(
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    records_by_dataset = group_in_domain_records(records)
+    per_dataset = {}
+    for dataset_name in IN_DOMAIN_DATASETS:
+        dataset_records = records_by_dataset[dataset_name]
+        dataset_total = len(dataset_records)
+        per_dataset[dataset_name] = {
+            f"{branch_name}_{metric_name}": to_percentage(
+                sum(
+                    float(record[f"{branch_name}_{record_field}"])
+                    for record in dataset_records
+                )
+                / dataset_total
+            )
+            for branch_name in ("direct", "tiser")
+            for metric_name, record_field in (("em", "em"), ("f1", "f1"))
+        }
+    return per_dataset
 
 
 def write_combined_summary(
     path: Path,
     records: list[dict[str, Any]],
-) -> dict[str, float | int]:
+) -> dict[str, Any]:
     summary = {
         "total_examples": len(records),
         **summarize_combined_branch(records, "direct"),
         **summarize_combined_branch(records, "tiser"),
+        "in_domain_per_dataset": (
+            compute_combined_per_dataset_metrics(records) if records else {}
+        ),
     }
 
     with path.open("w", encoding="utf-8") as file:
@@ -613,6 +810,33 @@ def write_combined_summary(
         file.write("\n")
 
     return summary
+
+
+def run_existing_results_rescore(args: argparse.Namespace) -> None:
+    if args.rescore_existing.resolve() == args.output_summary.resolve():
+        raise ValueError(
+            "--output-summary must differ from --rescore-existing so predictions "
+            "remain unchanged."
+        )
+    records = read_jsonl_read_only(args.rescore_existing)
+    rescored_records = rescore_combined_records(records)
+    args.output_summary.parent.mkdir(parents=True, exist_ok=True)
+    summary = write_combined_summary(args.output_summary, rescored_records)
+
+    print(f"Rescored existing predictions: {args.rescore_existing}")
+    print(f"Saved corrected summary to: {args.output_summary}")
+    for branch_name, label in (("direct", "Direct"), ("tiser", "TISER")):
+        print(f"{label} five-dataset Macro EM: {summary[f'{branch_name}_macro_em']:.2f}%")
+        print(
+            f"{label} five-dataset Macro F1: "
+            f"{summary[f'{branch_name}_macro_token_f1']:.2f}%"
+        )
+        print(
+            f"{label} in-domain generated tokens: "
+            f"average "
+            f"{summary[f'{branch_name}_in_domain_average_generated_tokens']:.2f}, "
+            f"total {summary[f'{branch_name}_in_domain_total_generated_tokens']}"
+        )
 
 
 def run_combined_prompt_evaluation(
@@ -723,25 +947,41 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
         print(f"Saved predictions to: {results_path}")
         print(f"Saved summary to: {summary_path}")
-        print(f"Direct overall EM: {summary['direct_overall_em']:.2f}%")
         print(
-            "Direct overall token-level F1: "
+            "Direct pooled EM over all retained examples: "
+            f"{summary['direct_overall_em']:.2f}%"
+        )
+        print(
+            "Direct pooled token-level F1 over all retained examples: "
             f"{summary['direct_overall_token_f1']:.2f}%"
         )
-        print(f"Direct macro EM: {summary['direct_macro_em']:.2f}%")
+        print(f"Direct five-dataset macro EM: {summary['direct_macro_em']:.2f}%")
         print(
-            "Direct macro token-level F1: "
+            "Direct five-dataset macro token-level F1: "
             f"{summary['direct_macro_token_f1']:.2f}%"
         )
-        print(f"TISER overall EM: {summary['tiser_overall_em']:.2f}%")
         print(
-            "TISER overall token-level F1: "
+            "Direct in-domain generated tokens: "
+            f"average {summary['direct_in_domain_average_generated_tokens']:.2f}, "
+            f"total {summary['direct_in_domain_total_generated_tokens']}"
+        )
+        print(
+            "TISER pooled EM over all retained examples: "
+            f"{summary['tiser_overall_em']:.2f}%"
+        )
+        print(
+            "TISER pooled token-level F1 over all retained examples: "
             f"{summary['tiser_overall_token_f1']:.2f}%"
         )
-        print(f"TISER macro EM: {summary['tiser_macro_em']:.2f}%")
+        print(f"TISER five-dataset macro EM: {summary['tiser_macro_em']:.2f}%")
         print(
-            "TISER macro token-level F1: "
+            "TISER five-dataset macro token-level F1: "
             f"{summary['tiser_macro_token_f1']:.2f}%"
+        )
+        print(
+            "TISER in-domain generated tokens: "
+            f"average {summary['tiser_in_domain_average_generated_tokens']:.2f}, "
+            f"total {summary['tiser_in_domain_total_generated_tokens']}"
         )
         return
 
@@ -790,11 +1030,18 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     print(f"Saved predictions to: {results_path}")
     print(f"Saved summary to: {summary_path}")
-    print(f"Overall EM: {summary['overall_em']:.2f}%")
-    print(f"Overall token-level F1: {summary['overall_token_f1']:.2f}%")
-    print(f"Macro EM: {summary['macro_em']:.2f}%")
-    print(f"Macro token-level F1: {summary['macro_token_f1']:.2f}%")
+    print(f"Pooled EM over all retained examples: {summary['overall_em']:.2f}%")
+    print(
+        "Pooled token-level F1 over all retained examples: "
+        f"{summary['overall_token_f1']:.2f}%"
+    )
+    print(f"Five-dataset macro EM: {summary['macro_em']:.2f}%")
+    print(f"Five-dataset macro token-level F1: {summary['macro_token_f1']:.2f}%")
 
 
 if __name__ == "__main__":
-    run_evaluation(parse_args())
+    cli_args = parse_args()
+    if cli_args.rescore_existing is not None:
+        run_existing_results_rescore(cli_args)
+    else:
+        run_evaluation(cli_args)

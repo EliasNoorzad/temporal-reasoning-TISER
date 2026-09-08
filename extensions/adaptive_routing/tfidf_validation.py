@@ -19,7 +19,15 @@ SIGNAL_COLUMNS = (
     "tfidf_concentration",
     "tfidf_effective_evidence_count",
 )
-REQUIRED_COLUMNS = METRIC_COLUMNS + SIGNAL_COLUMNS
+IN_DOMAIN_DATASETS = (
+    "tgqa_test",
+    "tempreason_l2_test",
+    "tempreason_l3_test",
+    "timeqa_easy_test",
+    "timeqa_hard_test",
+)
+NUMERIC_COLUMNS = METRIC_COLUMNS + SIGNAL_COLUMNS
+REQUIRED_COLUMNS = ("dataset_name", *NUMERIC_COLUMNS)
 QUARTILE_LABELS = (
     "Q1 - Lowest",
     "Q2",
@@ -63,14 +71,24 @@ def load_validation_data(path: Path) -> pd.DataFrame:
     if missing_columns:
         missing = ", ".join(sorted(missing_columns))
         raise KeyError(f"Input JSONL is missing required columns: {missing}")
+    if dataframe["dataset_name"].isna().any():
+        raise ValueError("The dataset_name column must not contain missing values.")
+    available_datasets = set(dataframe["dataset_name"])
+    missing_datasets = set(IN_DOMAIN_DATASETS).difference(available_datasets)
+    if missing_datasets:
+        missing = ", ".join(sorted(missing_datasets))
+        raise ValueError(f"Input JSONL is missing in-domain datasets: {missing}")
+    dataframe = dataframe.loc[
+        dataframe["dataset_name"].isin(IN_DOMAIN_DATASETS)
+    ].copy()
     if len(dataframe) < 4:
         raise ValueError("At least four examples are required to create quartiles.")
 
-    for column in REQUIRED_COLUMNS:
+    for column in NUMERIC_COLUMNS:
         dataframe[column] = pd.to_numeric(dataframe[column], errors="raise").astype(
             float
         )
-    if dataframe.loc[:, REQUIRED_COLUMNS].isna().any().any():
+    if dataframe.loc[:, list(NUMERIC_COLUMNS)].isna().any().any():
         raise ValueError("Required metric and TF-IDF columns must not contain missing values.")
 
     dataframe["em_gain"] = dataframe["tiser_em"] - dataframe["direct_em"]

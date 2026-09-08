@@ -13,14 +13,12 @@ from transformers import AutoTokenizer
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 THRESHOLDS = (101, 120, 140, 163, 197, 237, 315, 497)
-REQUIRED_COLUMNS = (
-    "temporal_context",
-    "direct_em",
-    "tiser_em",
-    "direct_f1",
-    "tiser_f1",
-    "direct_generated_tokens",
-    "tiser_generated_tokens",
+IN_DOMAIN_DATASETS = (
+    "tgqa_test",
+    "tempreason_l2_test",
+    "tempreason_l3_test",
+    "timeqa_easy_test",
+    "timeqa_hard_test",
 )
 NUMERIC_COLUMNS = (
     "direct_em",
@@ -30,6 +28,7 @@ NUMERIC_COLUMNS = (
     "direct_generated_tokens",
     "tiser_generated_tokens",
 )
+REQUIRED_COLUMNS = ("dataset_name", "temporal_context", *NUMERIC_COLUMNS)
 OUTPUT_COLUMNS = (
     "threshold",
     "routed_em",
@@ -70,6 +69,17 @@ def load_routing_data(path: Path) -> pd.DataFrame:
     if dataframe.empty:
         raise ValueError("Input JSONL contains no examples.")
 
+    if dataframe["dataset_name"].isna().any():
+        raise ValueError("The dataset_name column must not contain missing values.")
+    available_datasets = set(dataframe["dataset_name"])
+    missing_datasets = set(IN_DOMAIN_DATASETS).difference(available_datasets)
+    if missing_datasets:
+        missing = ", ".join(sorted(missing_datasets))
+        raise ValueError(f"Input JSONL is missing in-domain datasets: {missing}")
+    dataframe = dataframe.loc[
+        dataframe["dataset_name"].isin(IN_DOMAIN_DATASETS)
+    ].copy()
+
     for column in NUMERIC_COLUMNS:
         dataframe[column] = pd.to_numeric(dataframe[column], errors="raise").astype(
             float
@@ -107,10 +117,23 @@ def percentage(numerator: int | float, denominator: int | float) -> float:
     return float(numerator / denominator * 100.0)
 
 
+def calculate_macro_metric(
+    dataframe: pd.DataFrame,
+    metric_values: pd.Series | np.ndarray,
+) -> float:
+    values = pd.Series(np.asarray(metric_values, dtype=float), index=dataframe.index)
+    dataset_means = values.groupby(dataframe["dataset_name"]).mean()
+    missing_datasets = set(IN_DOMAIN_DATASETS).difference(dataset_means.index)
+    if missing_datasets:
+        missing = ", ".join(sorted(missing_datasets))
+        raise ValueError(f"Cannot calculate macro metrics without datasets: {missing}")
+    return float(dataset_means.loc[list(IN_DOMAIN_DATASETS)].mean() * 100.0)
+
+
 def calculate_baseline(dataframe: pd.DataFrame, path_name: str) -> dict[str, float]:
     return {
-        "em": float(dataframe[f"{path_name}_em"].mean() * 100.0),
-        "f1": float(dataframe[f"{path_name}_f1"].mean() * 100.0),
+        "em": calculate_macro_metric(dataframe, dataframe[f"{path_name}_em"]),
+        "f1": calculate_macro_metric(dataframe, dataframe[f"{path_name}_f1"]),
         "average_generated_tokens": float(
             dataframe[f"{path_name}_generated_tokens"].mean()
         ),
@@ -153,8 +176,8 @@ def evaluate_thresholds(
             dataframe["tiser_generated_tokens"],
         )
 
-        routed_em = float(np.mean(routed_em_values) * 100.0)
-        routed_f1 = float(np.mean(routed_f1_values) * 100.0)
+        routed_em = calculate_macro_metric(dataframe, routed_em_values)
+        routed_f1 = calculate_macro_metric(dataframe, routed_f1_values)
         total_generated_tokens = float(np.sum(routed_token_values))
         direct_count = int(route_to_direct.sum())
         tiser_count = int(route_to_tiser.sum())
@@ -230,8 +253,8 @@ def print_context_statistics(context_tokens: pd.Series) -> None:
 
 def print_baseline(name: str, baseline: dict[str, float]) -> None:
     print(f"{name}:")
-    print(f"  EM: {baseline['em']:.2f}%")
-    print(f"  F1: {baseline['f1']:.2f}%")
+    print(f"  Macro EM: {baseline['em']:.2f}%")
+    print(f"  Macro F1: {baseline['f1']:.2f}%")
     print(f"  Average generated tokens: {baseline['average_generated_tokens']:.2f}")
     print(f"  Total generated tokens: {baseline['total_generated_tokens']:.0f}")
 
@@ -239,9 +262,10 @@ def print_baseline(name: str, baseline: dict[str, float]) -> None:
 def print_selected_operating_point(sweep: pd.DataFrame) -> None:
     selected = sweep.loc[sweep["threshold"] == 163].iloc[0]
     print("\nApproximately 50% Direct operating point: threshold 163")
-    print(f"Routed EM: {selected['routed_em']:.2f}%")
-    print(f"Routed F1: {selected['routed_f1']:.2f}%")
+    print(f"Routed Macro EM: {selected['routed_em']:.2f}%")
+    print(f"Routed Macro F1: {selected['routed_f1']:.2f}%")
     print(f"Average generated tokens: {selected['avg_generated_tokens']:.2f}")
+    print(f"Total generated tokens: {selected['total_generated_tokens']:.0f}")
     print(f"Sent to Direct: {selected['direct_pct']:.2f}%")
     print(f"Sent to TISER: {selected['tiser_pct']:.2f}%")
     print(
@@ -292,7 +316,7 @@ def main() -> None:
     print_baseline("Always TISER", tiser_baseline)
     print(f"\nBoth-correct examples: {int(both_correct.sum())}")
     print(f"TISER-rescue examples: {int(tiser_rescue.sum())}")
-    print("\nThreshold sweep")
+    print("\nThreshold sweep (EM/F1 columns are five-dataset macro percentages)")
     print(sweep.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
     print_selected_operating_point(sweep)
     print(f"\nSaved threshold sweep to: {args.output}")

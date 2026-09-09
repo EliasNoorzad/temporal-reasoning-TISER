@@ -158,7 +158,11 @@ def load_evaluation_model(args: argparse.Namespace) -> tuple[Any, torch.nn.Modul
             raise ValueError("--lora-adapter-path is required when --model-type lora.")
         # LoRA runs use the same Qwen base model, then attach only the trained
         # adapter weights so the base and fine-tuned conditions stay comparable.
-        model = PeftModel.from_pretrained(model, args.lora_adapter_path)
+        model = PeftModel.from_pretrained(
+            model,
+            args.lora_adapter_path,
+            subfolder="checkpoint-49040",
+        )
 
     model.eval()
     return tokenizer, model

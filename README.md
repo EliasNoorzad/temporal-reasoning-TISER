@@ -21,6 +21,36 @@ evidence is distributed, then selects Direct or TISER for each example.
 - [Trained LoRA checkpoint](https://huggingface.co/EliElias/TISER-Qwen2.5-3B-LoRA)
 - [Evaluation results dataset](https://huggingface.co/datasets/EliElias/TISER-Evaluation-Results)
 
+The Hugging Face evaluation-results dataset contains the saved outputs used for
+reproducibility:
+
+- `lora_both_results.jsonl` contains the original Direct and TISER predictions
+  and their metrics from the initial evaluation run, before post-hoc
+  normalization.
+- `lora_both_results_rescored.jsonl` contains the same saved predictions with
+  Direct and TISER EM/F1 recomputed by the final deterministic normalization in
+  `src/evaluate.py`.
+
+Rescoring does not rerun inference or modify any generated prediction.
+
+## Reproducibility Workflow
+
+The reproducible workflow does not require access to the author's private
+Google Drive:
+
+```text
+GitHub repository
+  -> Hugging Face LoRA checkpoint
+  -> Hugging Face saved evaluation predictions
+  -> deterministic rescoring with src/evaluate.py
+  -> adaptive-routing analysis
+  -> saved extension outputs
+```
+
+The notebooks can use temporary local Colab storage while running. The
+persistent LoRA checkpoint and reusable evaluation outputs are hosted publicly
+on Hugging Face, and every output path used by the CLI tools is configurable.
+
 ## Evaluation Setup
 
 The official TISER test split is filtered by the tokenized TISER prompt length.
@@ -80,12 +110,17 @@ The original pooled raw metrics over all 20,442 retained examples were:
 - Direct: EM 74.83%, token-level F1 81.27%.
 - TISER: EM 80.42%, token-level F1 85.91%.
 
+These pooled values are not directly comparable to the final five-dataset
+macro values: they use a different aggregation and include every retained test
+example, including the separate Test-of-Time semantic subset.
+
 The model predictions were not regenerated or edited to obtain the final
 scores. Evaluation applies deterministic post-hoc normalization and the correct
 five-dataset macro protocol. The normalization handles specific formatting
 differences in duration answers with `year`/`years`, event-boundary answers with
-`starts`/`ends`, and insignificant punctuation spacing. Its implementation is
-in `src/evaluate.py`.
+`starts`/`ends`, and insignificant punctuation spacing. This changes only how
+saved predictions and gold answers are compared; it does not change prediction
+text. The implementation is in `src/evaluate.py`.
 
 ## Adaptive Routing
 
@@ -166,9 +201,10 @@ python -m src.train_lora \
   --num-train-epochs 2
 ```
 
-`--output-dir` can override the script's default Google Drive checkpoint path.
-The repository's published adapter stores the selected weights in the
-`checkpoint-49040` subfolder. Run combined Direct and TISER evaluation with:
+`--output-dir` makes checkpoint storage configurable. The published adapter
+stores the selected weights in the `checkpoint-49040` subfolder, so it can be
+loaded directly from its Hugging Face repository for combined Direct and TISER
+evaluation:
 
 ```bash
 python src/evaluate.py \
@@ -182,13 +218,23 @@ python src/evaluate.py \
 PEFT loads the published adapter from Hugging Face and attaches it to the same
 `Qwen/Qwen2.5-3B-Instruct` base model. `notebooks/run_train_lora.ipynb` and
 `notebooks/run_test_lora.ipynb` record the Google Colab workflows used in the
-project; the CLI above reflects the current adapter-subfolder loading interface.
+project. Private Drive access is not required for reproduction; Colab can use
+temporary local paths with the public Hugging Face checkpoint and saved
+evaluation outputs.
 
 ## Rescoring Existing Predictions
 
 Existing combined predictions can be rescored without loading a model or
-running inference. The command preserves prediction text and token counts,
-recomputes only Direct/TISER EM and F1, and writes a new JSONL file:
+running inference. The implemented interface is:
+
+```bash
+python src/evaluate.py \
+  --rescore-existing <raw_results.jsonl> \
+  --output-rescored-results <rescored_results.jsonl> \
+  --output-summary <summary.json>
+```
+
+For the public result filenames, the corresponding command is:
 
 ```bash
 python src/evaluate.py \
@@ -196,6 +242,11 @@ python src/evaluate.py \
   --output-rescored-results results/lora_both_results_rescored.jsonl \
   --output-summary results/lora_both_summary_rescored.json
 ```
+
+This reads the original saved predictions, applies the final deterministic
+normalization, recomputes Direct and TISER EM/F1, and writes a new JSONL plus
+summary. It preserves the original generated answers and does not perform model
+generation.
 
 The rescored JSONL can be used directly by the adaptive-routing workflow:
 

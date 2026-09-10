@@ -51,35 +51,63 @@ rescue statistics are calculated over all 19,102 retained examples.
 - `context_length_baseline.py` sweeps context-token thresholds and reports the
   threshold `163` comparison point.
 
-## Usage
+## Reproducible Workflow
+
+The analysis starts from `lora_both_results_rescored.jsonl` in the public
+[TISER evaluation-results dataset](https://huggingface.co/datasets/EliElias/TISER-Evaluation-Results).
+This file contains the original saved Direct and TISER predictions with EM/F1
+recomputed using the final deterministic normalization in `src/evaluate.py`.
+No inference is rerun during rescoring.
+
+Download the file with `huggingface_hub`:
+
+```python
+from huggingface_hub import hf_hub_download
+
+input_path = hf_hub_download(
+    repo_id="EliElias/TISER-Evaluation-Results",
+    filename="lora_both_results_rescored.jsonl",
+    repo_type="dataset",
+)
+print(input_path)
+```
+
+Pass the downloaded path to the analysis scripts. The following commands write
+working outputs to `extension_1/`; each script creates its required output
+directory.
 
 ```bash
 python extensions/adaptive_routing/tfidf_analysis.py \
-  --input lora_both_results_rescored.jsonl \
-  --output tfidf_analysis.jsonl \
-  --summary-output tfidf_analysis_summary.csv
+  --input <downloaded_file_path> \
+  --output extension_1/tfidf_analysis.jsonl \
+  --summary-output extension_1/tfidf_analysis_summary.csv
 
 python extensions/adaptive_routing/tfidf_validation.py \
-  --input tfidf_analysis.jsonl \
-  --output-dir tfidf_validation
+  --input extension_1/tfidf_analysis.jsonl \
+  --output-dir extension_1
 
 python extensions/adaptive_routing/tfidf_router.py \
-  --input tfidf_analysis.jsonl \
-  --output tfidf_router_thresholds.csv
+  --input extension_1/tfidf_analysis.jsonl \
+  --output extension_1/tfidf_router_sweep.csv
 
 python extensions/adaptive_routing/context_length_baseline.py \
-  --input tfidf_analysis.jsonl \
-  --output context_length_thresholds.csv
+  --input extension_1/tfidf_analysis.jsonl \
+  --output extension_1/context_length_baseline.csv
 ```
+
+`notebooks/Extension_1.ipynb` follows this workflow using temporary
+`/content/extension_1` storage in Colab. Its final upload step publishes the
+generated files under `extension_1/` in the same Hugging Face
+evaluation-results dataset.
 
 ## Final Comparison
 
-| Method | Macro EM | Macro F1 | Generated-token saving vs Always TISER |
-| --- | ---: | ---: | ---: |
-| Always Direct | 79.07 | 85.54 | - |
-| Always TISER | 86.14 | 90.73 | 0.00% |
-| Context length, threshold 163 | 83.31 | 88.79 | 47.96% |
-| TF-IDF router, threshold 6 | 84.36 | 89.56 | 50.05% |
+| Method | Macro EM | Macro F1 | Avg. generated tokens | Total generated tokens | Direct | TISER | Token saving vs. Always TISER |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Always Direct | 79.07 | 85.54 | 5.93 | 113,257 | 100.00% | 0.00% | - |
+| Always TISER | 86.14 | 90.73 | 272.00 | 5,195,747 | 0.00% | 100.00% | 0.00% |
+| Context length, threshold 163 | 83.31 | 88.79 | 141.56 | 2,703,997 | 53.28% | 46.72% | 47.96% |
+| TF-IDF router, threshold 6 | 84.36 | 89.56 | 135.87 | 2,595,310 | 54.89% | 45.11% | 50.05% |
 
 At a similar Direct/TISER routing ratio, the TF-IDF router provides a better
 answer-quality and generated-token trade-off than the context-length baseline.

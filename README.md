@@ -1,5 +1,4 @@
-# Adaptive Routing for TISER-Based Temporal
-Question Answering
+# Adaptive Routing for TISER-Based Temporal Question Answering
 
 This repository reproduces the TISER temporal reasoning workflow using
 `Qwen/Qwen2.5-3B-Instruct` as the base model and LoRA supervised fine-tuning on

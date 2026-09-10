@@ -55,21 +55,21 @@ rescue statistics are calculated over all 19,102 retained examples.
 
 ```bash
 python extensions/adaptive_routing/tfidf_analysis.py \
-  --input results/lora_both_results.jsonl \
-  --output results/tfidf_analysis.jsonl \
-  --summary-output results/tfidf_analysis_summary.csv
+  --input lora_both_results_rescored.jsonl \
+  --output tfidf_analysis.jsonl \
+  --summary-output tfidf_analysis_summary.csv
 
 python extensions/adaptive_routing/tfidf_validation.py \
-  --input results/tfidf_analysis.jsonl \
-  --output-dir results/tfidf_validation
+  --input tfidf_analysis.jsonl \
+  --output-dir tfidf_validation
 
 python extensions/adaptive_routing/tfidf_router.py \
-  --input results/tfidf_analysis.jsonl \
-  --output results/tfidf_router_thresholds.csv
+  --input tfidf_analysis.jsonl \
+  --output tfidf_router_thresholds.csv
 
 python extensions/adaptive_routing/context_length_baseline.py \
-  --input results/tfidf_analysis.jsonl \
-  --output results/context_length_thresholds.csv
+  --input tfidf_analysis.jsonl \
+  --output context_length_thresholds.csv
 ```
 
 ## Final Comparison

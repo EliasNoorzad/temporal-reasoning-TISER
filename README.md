@@ -164,14 +164,6 @@ extensions/adaptive_routing/
   tfidf_validation.py        Quartile and correlation analysis
   tfidf_router.py            Effective-evidence threshold sweep
   context_length_baseline.py Context-length threshold sweep
-
-extensions/context_filtering/
-  context_filter.py          Top-k context-sentence filtering
-  evaluate_filtered_context.py
-  complexity_filter_policy.py
-
-checkpoints/train_lora/       Placeholder for local or Colab adapter checkpoints
-results/                      Placeholder for generated evaluation artifacts
 ```
 
 ## Installation
@@ -211,7 +203,7 @@ python src/evaluate.py \
   --model-type lora \
   --prompt-type both \
   --lora-adapter-path EliElias/TISER-Qwen2.5-3B-LoRA \
-  --output-dir results \
+  --output-dir evaluation_outputs \
   --batch-size 16
 ```
 
@@ -238,9 +230,9 @@ For the public result filenames, the corresponding command is:
 
 ```bash
 python src/evaluate.py \
-  --rescore-existing results/lora_both_results.jsonl \
-  --output-rescored-results results/lora_both_results_rescored.jsonl \
-  --output-summary results/lora_both_summary_rescored.json
+  --rescore-existing lora_both_results.jsonl \
+  --output-rescored-results lora_both_results_rescored.jsonl \
+  --output-summary lora_both_summary_rescored.json
 ```
 
 This reads the original saved predictions, applies the final deterministic
@@ -252,21 +244,21 @@ The rescored JSONL can be used directly by the adaptive-routing workflow:
 
 ```bash
 python extensions/adaptive_routing/tfidf_analysis.py \
-  --input results/lora_both_results_rescored.jsonl \
-  --output results/tfidf_analysis.jsonl \
-  --summary-output results/tfidf_analysis_summary.csv
+  --input lora_both_results_rescored.jsonl \
+  --output tfidf_analysis.jsonl \
+  --summary-output tfidf_analysis_summary.csv
 
 python extensions/adaptive_routing/tfidf_validation.py \
-  --input results/tfidf_analysis.jsonl \
-  --output-dir results/tfidf_validation
+  --input tfidf_analysis.jsonl \
+  --output-dir tfidf_validation
 
 python extensions/adaptive_routing/tfidf_router.py \
-  --input results/tfidf_analysis.jsonl \
-  --output results/tfidf_router_sweep.csv
+  --input tfidf_analysis.jsonl \
+  --output tfidf_router_sweep.csv
 
 python extensions/adaptive_routing/context_length_baseline.py \
-  --input results/tfidf_analysis.jsonl \
-  --output results/context_length_baseline.csv
+  --input tfidf_analysis.jsonl \
+  --output context_length_baseline.csv
 ```
 
 See `notebooks/Extension_1.ipynb` and

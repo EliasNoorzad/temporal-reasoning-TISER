@@ -117,8 +117,8 @@ def get_complexity_score(
 
 
 def assign_complexity_quartiles(complexity_score: pd.Series) -> pd.Series:
-    # Direct quantiles preserve the original feature distribution while giving
-    # Q1 and Q4 the same low-to-high complexity meaning for both signals.
+    # Apply qcut to the scores themselves, matching the validation protocol
+    # rather than assigning arbitrary ranks to tied values.
     return pd.qcut(
         complexity_score,
         q=4,

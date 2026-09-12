@@ -160,7 +160,6 @@ def evaluate_thresholds(
     rows = []
 
     for threshold in THRESHOLDS:
-        # Short contexts take the Direct path; longer contexts use TISER.
         route_to_direct = dataframe["context_tokens"] < threshold
         route_to_tiser = ~route_to_direct
 
@@ -201,7 +200,6 @@ def evaluate_thresholds(
             if tiser_gain_over_direct != 0.0
             else float("nan")
         )
-        # Measure cost reduction against sending every example through TISER.
         token_saving_pct = (
             (1.0 - total_generated_tokens / tiser_baseline["total_generated_tokens"])
             * 100.0
@@ -267,7 +265,6 @@ def print_baseline(name: str, baseline: dict[str, float]) -> None:
 
 
 def print_selected_operating_point(sweep: pd.DataFrame) -> None:
-    # This sweep point gives the approximately even routing mix used for comparison.
     selected = sweep.loc[sweep["threshold"] == 163].iloc[0]
     print("\nApproximately 50% Direct operating point: threshold 163")
     print(f"Routed Macro EM: {selected['routed_em']:.2f}%")

@@ -135,8 +135,6 @@ def evaluate_thresholds(
     rows = []
 
     for threshold in THRESHOLDS:
-        # Low effective evidence count means relevance is concentrated enough for
-        # Direct; more dispersed evidence is sent through TISER.
         route_to_direct = dataframe[ROUTING_SIGNAL] < threshold
         route_to_tiser = ~route_to_direct
 
@@ -180,7 +178,6 @@ def evaluate_thresholds(
             if tiser_gain_over_direct != 0.0
             else float("nan")
         )
-        # Always-TISER is the generation-cost reference for every threshold.
         token_saving_pct = (
             (1.0 - total_generated_tokens / tiser_baseline["total_generated_tokens"])
             * 100.0
@@ -227,7 +224,6 @@ def print_baseline(name: str, baseline: dict[str, float]) -> None:
 
 
 def print_selected_operating_point(sweep: pd.DataFrame) -> None:
-    # Report the operating point selected from the full threshold sweep.
     selected = sweep.loc[sweep["threshold"] == 6].iloc[0]
     print("\nSelected operating point: threshold 6")
     print(f"Routed Macro EM: {selected['routed_em']:.2f}%")

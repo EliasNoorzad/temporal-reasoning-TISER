@@ -10,6 +10,8 @@ from typing import Any
 
 from datasets import DatasetDict, load_dataset
 
+# Direct execution has no package context, so expose the project root before
+# importing the shared model utilities.
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -41,8 +43,8 @@ def load_filtered_test_dataset(max_input_tokens: int = 2048) -> Any:
 
     tokenizer = load_qwen_tokenizer()
 
-    # Extremely long test prompts are excluded from evaluation. We keep TISER
-    # prompts up to 2048 tokens, matching the context range used in our experiments.
+    # Filter on the original TISER prompt so every prompt condition uses the
+    # same examples. The default keeps the 2048-token range used in evaluation.
     original_test_examples = len(test_dataset)
     valid_indices = []
     for i, example in enumerate(test_dataset):

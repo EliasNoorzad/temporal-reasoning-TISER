@@ -61,6 +61,8 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def split_context_sentences(text: Any) -> list[str]:
+    # Sentence-level units let the analysis measure whether relevance is
+    # concentrated in one statement or spread across the temporal context.
     return [
         sentence.strip()
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", str(text))
@@ -85,6 +87,8 @@ def build_corpus(
         for context_sentences in context_sentences_by_example
         for sentence in context_sentences
     ]
+    # Fit one shared vocabulary and IDF scale across all questions and context
+    # sentences so similarity values are comparable across examples.
     corpus = questions + all_context_sentences
     return corpus, questions, context_sentences_by_example
 
@@ -116,9 +120,13 @@ def compute_features(
         }
 
     vectors = vectorizer.transform([question, *context_sentences])
+    # TF-IDF vectors are L2-normalized, so the linear kernel here is cosine
+    # similarity without an additional normalization pass.
     similarities = linear_kernel(vectors[0:1], vectors[1:]).ravel()
     total_similarity = float(np.sum(similarities, dtype=np.float64))
 
+    # Treat floating-point residue as no lexical overlap rather than creating an
+    # unstable relevance distribution from a near-zero denominator.
     if total_similarity <= 1e-12:
         return {
             "tfidf_n_sentences": sentence_count,
@@ -134,6 +142,8 @@ def compute_features(
     probabilities = positive_similarities / total_similarity
     entropy = -float(np.sum(probabilities * np.log(probabilities)))
 
+    # Exponentiated entropy is the effective number of equally relevant
+    # sentences: low values are concentrated, while high values are dispersed.
     return {
         "tfidf_n_sentences": sentence_count,
         "tfidf_concentration": float(np.max(similarities) / total_similarity),
@@ -155,6 +165,8 @@ def write_output_jsonl(
             desc="Writing TF-IDF features",
             unit="records",
         ):
+            # Preserve the evaluation record so routing can reuse its saved
+            # Direct/TISER answers, metrics, and token counts.
             output_record = dict(record)
             output_record.update(features)
             file.write(json.dumps(output_record, ensure_ascii=False) + "\n")

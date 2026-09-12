@@ -27,6 +27,8 @@ def get_default_dtype() -> torch.dtype:
     return torch.float32
 
 
+# Dataset filtering and model loading both need this tokenizer. Caching avoids
+# loading the same Hugging Face artifacts twice in one process.
 @lru_cache(maxsize=1)
 def load_qwen_tokenizer(model_name: str = MODEL_NAME) -> AutoTokenizer:
     """Load and reuse the Qwen tokenizer within one Python process."""

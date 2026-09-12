@@ -179,9 +179,13 @@ def format_prompts_for_generation(
     prompt_texts: list[str],
     prompt_type: str,
 ) -> list[str]:
+    # The dataset's TISER prompt is already fully formatted. Only Direct prompts
+    # need the Qwen chat envelope used for instruction-tuned generation.
     if prompt_type != "standard":
         return prompt_texts
 
+    # Format each prompt before batching so every row gets its own role markers
+    # and assistant-generation marker without changing the prompt text itself.
     return [
         tokenizer.apply_chat_template(
             [
@@ -299,6 +303,8 @@ def generate_responses_with_metadata(
         prompt_type,
     )
 
+    # Left padding gives every row the same continuation boundary, which is also
+    # the offset used below for per-example generated-token counts.
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
@@ -321,6 +327,8 @@ def generate_responses_with_metadata(
     if prompt_type == "tiser":
         if tokenizer.eos_token_id is None:
             raise ValueError("TISER batched stopping requires an EOS token.")
+        # Completed rows are forced to EOS independently, allowing unfinished
+        # rows in the same batch to continue to their own closing answer tag.
         generation_args["logits_processor"] = LogitsProcessorList(
             [
                 AnswerClosingTagLogitsProcessor(
@@ -407,6 +415,8 @@ def normalize_answer(prediction: Any, gold_answer: Any) -> tuple[str, str]:
     prediction = str(prediction).strip()
     gold_answer = str(gold_answer).strip()
 
+    # These suffix rules apply only when the gold answer declares the relevant
+    # dataset format, leaving unrelated answer text untouched.
     if re.search(r"\s+years?$", gold_answer, flags=re.IGNORECASE):
         prediction = re.sub(
             r"\s+years?$",
@@ -421,6 +431,8 @@ def normalize_answer(prediction: Any, gold_answer: Any) -> tuple[str, str]:
             flags=re.IGNORECASE,
         ).strip()
 
+    # Event-boundary answers may include a starts/ends label and surrounding
+    # parentheses; both sides receive the same deterministic normalization.
     if re.search(r"\s+(starts|ends)$", gold_answer, flags=re.IGNORECASE):
         prediction = re.sub(
             r"\s+(starts|ends)$",
@@ -622,6 +634,8 @@ def rescore_combined_records(
         "tiser_generated_tokens",
     )
     rescored_records = []
+    # Reuse every saved prediction and token count. Rescoring replaces only the
+    # four Direct/TISER metric fields and never performs another model run.
     for record_number, record in enumerate(records, start=1):
         missing_fields = set(required_fields).difference(record)
         if missing_fields:
@@ -870,6 +884,8 @@ def run_combined_prompt_evaluation(
     test_dataset: Any,
     results_path: Path,
 ) -> None:
+    # Results are flushed after every batch. On restart, skip examples already
+    # present in the JSONL file and append only the unfinished portion.
     existing_records = read_jsonl(results_path)
     completed_question_ids = {
         str(record["question_id"])
@@ -909,6 +925,8 @@ def run_combined_prompt_evaluation(
                     for example in batch_examples
                 ]
 
+                # Save both branches once per example so later routing sweeps can
+                # select between their answers and token costs without inference.
                 direct_generations = generate_responses_with_metadata(
                     model=model,
                     tokenizer=tokenizer,

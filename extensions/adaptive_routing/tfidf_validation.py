@@ -78,6 +78,8 @@ def load_validation_data(path: Path) -> pd.DataFrame:
     if missing_datasets:
         missing = ", ".join(sorted(missing_datasets))
         raise ValueError(f"Input JSONL is missing in-domain datasets: {missing}")
+    # The main comparison uses the five in-domain datasets; semantic Test-of-Time
+    # examples can remain in the feature file but do not enter these statistics.
     dataframe = dataframe.loc[
         dataframe["dataset_name"].isin(IN_DOMAIN_DATASETS)
     ].copy()
@@ -107,12 +109,16 @@ def get_complexity_score(
     signal: str,
 ) -> pd.Series:
     raw_feature = dataframe[signal]
+    # Lower concentration means evidence is more dispersed, so reverse this
+    # feature to keep "higher score = higher complexity" for both signals.
     if signal == "tfidf_concentration":
         return -raw_feature
     return raw_feature
 
 
 def assign_complexity_quartiles(complexity_score: pd.Series) -> pd.Series:
+    # Direct quantiles preserve the original feature distribution while giving
+    # Q1 and Q4 the same low-to-high complexity meaning for both signals.
     return pd.qcut(
         complexity_score,
         q=4,
@@ -146,6 +152,8 @@ def calculate_quartile_summary(
         )
         .reset_index()
     )
+    # Keep feature values on their natural scale and report only performance,
+    # gains, and rates as percentages.
     summary.loc[:, list(PERCENTAGE_COLUMNS)] *= 100.0
     return summary
 

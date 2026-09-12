@@ -275,6 +275,8 @@ def write_validation_metrics(
 ) -> Path:
     output_path = output_dir / "validation_metrics.json"
     temporary_path = output_dir / "validation_metrics.json.tmp"
+    # Replace a complete temporary file so an interrupted write does not leave
+    # a partially written validation history.
     with temporary_path.open("w", encoding="utf-8") as file:
         json.dump(validation_metrics, file, indent=2)
         file.write("\n")
@@ -487,6 +489,8 @@ def main() -> None:
     ]
 
     model = model_bundle.model
+    # Autoregressive KV caching is unnecessary during training and conflicts
+    # with the memory-saving gradient-checkpointing path.
     model.config.use_cache = False
     if args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()

@@ -13,6 +13,8 @@ def extract_temporal_context(tiser_prompt: str) -> str:
     """Extract the context block from the dataset's TISER prompt."""
     prompt_text = str(tiser_prompt)
 
+    # The official prompt embeds context between stable section markers. The
+    # Direct condition reuses only that span, without TISER reasoning guidance.
     try:
         context_start = prompt_text.index(TEMPORAL_CONTEXT_MARKER) + len(
             TEMPORAL_CONTEXT_MARKER
@@ -32,6 +34,7 @@ def build_standard_prompt(example: dict[str, Any]) -> str:
     """Build the plain context-and-question prompt used in the standard condition."""
     question = str(example["question"])
     temporal_context = extract_temporal_context(str(example["prompt"]))
+    # Keep this prompt limited to the paper-style question and temporal context.
     return (
         "You are an AI assistant that has to respond to questions given a context.\n\n"
         f"Question: {question}\n\n"
@@ -46,6 +49,8 @@ def build_tiser_prompt(example: dict[str, Any]) -> str:
 
 def get_prompt_text(example: dict[str, Any], prompt_type: str) -> str:
     """Select the prompt format for an experiment condition."""
+    # Prompt selection is independent of whether evaluation uses the base model
+    # or the LoRA adapter.
     if prompt_type == "standard":
         return build_standard_prompt(example)
     if prompt_type == "tiser":

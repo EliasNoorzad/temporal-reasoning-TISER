@@ -73,6 +73,7 @@ def load_routing_data(path: Path) -> pd.DataFrame:
     if missing_datasets:
         missing = ", ".join(sorted(missing_datasets))
         raise ValueError(f"Input JSONL is missing in-domain datasets: {missing}")
+    # Route only the five in-domain datasets used by the reported macro scores.
     dataframe = dataframe.loc[
         dataframe["dataset_name"].isin(IN_DOMAIN_DATASETS)
     ].copy()
@@ -97,6 +98,8 @@ def calculate_macro_metric(
     metric_values: pd.Series | np.ndarray,
 ) -> float:
     values = pd.Series(np.asarray(metric_values, dtype=float), index=dataframe.index)
+    # Average within each dataset first so large datasets do not dominate the
+    # reported five-dataset macro score.
     dataset_means = values.groupby(dataframe["dataset_name"]).mean()
     missing_datasets = set(IN_DOMAIN_DATASETS).difference(dataset_means.index)
     if missing_datasets:
@@ -132,9 +135,13 @@ def evaluate_thresholds(
     rows = []
 
     for threshold in THRESHOLDS:
+        # Low effective evidence count means relevance is concentrated enough for
+        # Direct; more dispersed evidence is sent through TISER.
         route_to_direct = dataframe[ROUTING_SIGNAL] < threshold
         route_to_tiser = ~route_to_direct
 
+        # Both branch outputs are already stored in the input JSONL, so each
+        # threshold can be evaluated without another model run.
         routed_em_values = np.where(
             route_to_direct,
             dataframe["direct_em"],
@@ -173,6 +180,7 @@ def evaluate_thresholds(
             if tiser_gain_over_direct != 0.0
             else float("nan")
         )
+        # Always-TISER is the generation-cost reference for every threshold.
         token_saving_pct = (
             (1.0 - total_generated_tokens / tiser_baseline["total_generated_tokens"])
             * 100.0
@@ -219,6 +227,7 @@ def print_baseline(name: str, baseline: dict[str, float]) -> None:
 
 
 def print_selected_operating_point(sweep: pd.DataFrame) -> None:
+    # Report the operating point selected from the full threshold sweep.
     selected = sweep.loc[sweep["threshold"] == 6].iloc[0]
     print("\nSelected operating point: threshold 6")
     print(f"Routed Macro EM: {selected['routed_em']:.2f}%")

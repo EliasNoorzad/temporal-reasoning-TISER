@@ -208,11 +208,12 @@ python src/evaluate.py \
 ```
 
 PEFT loads the published adapter from Hugging Face and attaches it to the same
-`Qwen/Qwen2.5-3B-Instruct` base model. `notebooks/run_train_lora.ipynb` and
-`notebooks/run_test_lora.ipynb` record the Google Colab workflows used in the
-project. Private Drive access is not required for reproduction; Colab can use
-temporary local paths with the public Hugging Face checkpoint and saved
-evaluation outputs.
+`Qwen/Qwen2.5-3B-Instruct` base model. `notebooks/run_test_lora.ipynb` uses
+temporary Colab storage with the public Hugging Face checkpoint and saved
+evaluation outputs. `notebooks/run_train_lora.ipynb` records the original
+training run, including its historical Google Drive output paths; current
+training defaults to the local `checkpoints/train_lora` path. Private Drive
+access is not required for reproduction.
 
 ## Rescoring Existing Predictions
 

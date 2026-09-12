@@ -25,7 +25,7 @@ from src.evaluate import (
 from src.model import MODEL_NAME, load_qwen_model
 
 
-DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/TISER/checkpoints/train_lora/"
+DEFAULT_OUTPUT_DIR = "checkpoints/train_lora"
 DEFAULT_LORA_TARGET_MODULES = (
     # LoRA is applied to Qwen's attention projection layers, so the base model
     # stays frozen while these small adapter matrices learn the task.
